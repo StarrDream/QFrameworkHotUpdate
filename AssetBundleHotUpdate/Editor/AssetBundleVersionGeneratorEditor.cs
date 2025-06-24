@@ -41,6 +41,22 @@ namespace AssetBundleHotUpdate
         /// </summary>
         private string serverUrl = AssetBundleConfig.ServerUrl;
 
+
+        /// <summary>
+        /// 首包资源 不删除的
+        /// </summary>
+        private AssetBundleNameScriptable m_NameScriptableObject;
+
+        /// <summary>
+        /// 清单版本号
+        /// </summary>
+        private string manifestVersion = "1.0.0";
+
+        /// <summary>
+        /// 默认AB包版本号
+        /// </summary>
+        private string defaultBundleVersion = "1.0.0";
+
         #endregion
 
         #region Unity编辑器菜单和窗口初始化
@@ -84,6 +100,8 @@ namespace AssetBundleHotUpdate
                 // 绘制标题
                 EditorGUILayout.LabelField("AssetBundle 版本管理器", EditorStyles.boldLabel);
                 EditorGUILayout.Space();
+
+                m_NameScriptableObject = (AssetBundleNameScriptable)EditorGUILayout.ObjectField("首包资源名称列表", m_NameScriptableObject, typeof(AssetBundleNameScriptable), true);
 
                 // 绘制服务器URL配置区域
                 DrawServerConfig();
@@ -155,6 +173,25 @@ namespace AssetBundleHotUpdate
         {
             EditorGUILayout.LabelField("基础操作", EditorStyles.boldLabel);
 
+            // 版本号配置区域
+            EditorGUILayout.BeginVertical("box");
+            EditorGUILayout.LabelField("版本配置", EditorStyles.boldLabel);
+
+            EditorGUILayout.BeginHorizontal();
+            EditorGUILayout.LabelField("清单版本号:", GUILayout.Width(80));
+            manifestVersion = EditorGUILayout.TextField(manifestVersion);
+            EditorGUILayout.EndHorizontal();
+
+            EditorGUILayout.BeginHorizontal();
+            EditorGUILayout.LabelField("默认AB包版本:", GUILayout.Width(80));
+            defaultBundleVersion = EditorGUILayout.TextField(defaultBundleVersion);
+            EditorGUILayout.EndHorizontal();
+
+            EditorGUILayout.HelpBox("清单版本号：整个AB包清单的版本\n默认AB包版本：新生成AB包的默认版本号", MessageType.Info);
+            EditorGUILayout.EndVertical();
+
+            EditorGUILayout.Space();
+
             EditorGUILayout.BeginHorizontal();
             if (GUILayout.Button("扫描AssetBundle", GUILayout.Height(25)))
             {
@@ -173,6 +210,7 @@ namespace AssetBundleHotUpdate
 
             EditorGUILayout.EndHorizontal();
         }
+
 
         /// <summary>
         /// 绘制保存操作按钮
@@ -265,15 +303,15 @@ namespace AssetBundleHotUpdate
                     AssetDatabase.Refresh();
 
                     Debug.Log($"空版本清单已生成: {manifestPath}");
-                    Debug.Log("StreamingAssets中的AB包文件已删除，只保留空版本清单");
+                    Debug.Log("StreamingAssets中的AB包文件已删除，只保留空版本清单和必备资源");
 
                     // 显示完成对话框
                     EditorUtility.DisplayDialog("空版本清单生成完成",
                         "操作完成！\n\n" +
                         "• 已生成空版本清单（版本0.0.0）\n" +
                         "• 已删除StreamingAssets中的AB包文件\n" +
-                        "• 现在可以打包游戏，安装包将不包含AB包内容\n" +
-                        "• 游戏首次启动时会从服务器下载所有AB包", "确定");
+                        "• 现在可以打包游戏，安装包将只包含必备AB包内容\n" +
+                        "• 游戏首次启动时会从服务器下载你所选AB包", "确定");
                 }
                 catch (System.Exception e)
                 {
@@ -304,6 +342,11 @@ namespace AssetBundleHotUpdate
                 if (fileName == AssetBundleConfig.ManifestFileName || fileName.EndsWith(".meta"))
                     continue;
 
+                if (CheckName(fileName))
+                {
+                    continue;
+                }
+
                 try
                 {
                     File.Delete(file);
@@ -317,6 +360,24 @@ namespace AssetBundleHotUpdate
             }
 
             Debug.Log($"共删除了 {deletedCount} 个AB包文件");
+        }
+
+
+        /// <summary>
+        /// 不删除首包资源
+        /// </summary>
+        bool CheckName(string bundleName)
+        {
+            var nameList = m_NameScriptableObject.assetBundleNames;
+            foreach (var names in nameList)
+            {
+                if (names == bundleName)
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         #endregion
@@ -486,10 +547,35 @@ namespace AssetBundleHotUpdate
                 return;
             }
 
+            // 验证版本号格式
+            if (string.IsNullOrEmpty(manifestVersion))
+            {
+                Debug.LogError("清单版本号不能为空");
+                EditorUtility.DisplayDialog("版本号错误", "清单版本号不能为空", "确定");
+                return;
+            }
+
+            if (string.IsNullOrEmpty(defaultBundleVersion))
+            {
+                Debug.LogError("默认AB包版本号不能为空");
+                EditorUtility.DisplayDialog("版本号错误", "默认AB包版本号不能为空", "确定");
+                return;
+            }
+
+            // 如果已经存在清单，保留现有AB包的版本信息
+            Dictionary<string, string> existingVersions = new Dictionary<string, string>();
+            if (bundleManifest?.assetBundles != null)
+            {
+                foreach (var bundle in bundleManifest.assetBundles)
+                {
+                    existingVersions[bundle.bundleName] = bundle.version;
+                }
+            }
+
             // 创建新的版本清单
             bundleManifest = new AssetBundleManifest
             {
-                manifestVersion = "1.0.0",
+                manifestVersion = manifestVersion,
                 createTime = System.DateTime.Now.ToString("yyyy-MM-ddTHH:mm:ss.fffffffzzz"),
                 assetBundles = new List<AssetBundleInfo>()
             };
@@ -501,15 +587,24 @@ namespace AssetBundleHotUpdate
                 .ToArray();
 
             Debug.Log($"开始生成版本信息，共找到 {files.Length} 个AssetBundle文件");
+            Debug.Log($"使用清单版本号: {manifestVersion}");
+            Debug.Log($"默认AB包版本号: {defaultBundleVersion}");
 
             foreach (var file in files)
             {
                 try
                 {
+                    string bundleName = Path.GetFileName(file);
+
+                    // 如果存在旧版本信息，保留原版本号，否则使用默认版本号
+                    string bundleVersion = existingVersions.ContainsKey(bundleName)
+                        ? existingVersions[bundleName]
+                        : defaultBundleVersion;
+
                     var bundleInfo = new AssetBundleInfo
                     {
-                        bundleName = Path.GetFileName(file),
-                        version = "1.0.0",
+                        bundleName = bundleName,
+                        version = bundleVersion,
                         hash = CalculateFileHash(file),
                         size = new FileInfo(file).Length,
                         buildTime = File.GetLastWriteTime(file).ToString("yyyy-MM-dd HH:mm:ss"),
@@ -522,7 +617,9 @@ namespace AssetBundleHotUpdate
                     };
 
                     bundleManifest.assetBundles.Add(bundleInfo);
-                    Debug.Log($"已添加AB包: {bundleInfo.bundleName} (大小: {FormatFileSize(bundleInfo.size)})");
+
+                    string versionInfo = existingVersions.ContainsKey(bundleName) ? "(保留原版本)" : "(使用默认版本)";
+                    Debug.Log($"已添加AB包: {bundleInfo.bundleName} 版本:{bundleInfo.version} {versionInfo} (大小: {FormatFileSize(bundleInfo.size)})");
                 }
                 catch (System.Exception e)
                 {
@@ -535,9 +632,12 @@ namespace AssetBundleHotUpdate
             Repaint();
 
             EditorUtility.DisplayDialog("生成完成",
-                $"版本信息生成完成！\n\n共处理了 {bundleManifest.assetBundles.Count} 个AssetBundle文件\n" +
+                $"版本信息生成完成！\n\n" +
+                $"清单版本: {manifestVersion}\n" +
+                $"共处理了 {bundleManifest.assetBundles.Count} 个AssetBundle文件\n" +
                 "现在可以保存版本清单或生成热更新配置", "确定");
         }
+
 
         /// <summary>
         /// 分析依赖关系
@@ -721,25 +821,23 @@ namespace AssetBundleHotUpdate
             EditorGUILayout.LabelField($"创建时间: {bundleManifest.createTime}");
             EditorGUILayout.EndHorizontal();
 
-            // 优先级批量操作按钮
+            // 在批量优先级操作按钮后面添加版本号批量操作
             EditorGUILayout.BeginHorizontal("box");
-            EditorGUILayout.LabelField("批量优先级操作:", GUILayout.Width(120));
-            if (GUILayout.Button("全部设为最高优先级", GUILayout.Width(150)))
+            EditorGUILayout.LabelField("批量版本操作:", GUILayout.Width(120));
+            EditorGUILayout.LabelField("新版本号:", GUILayout.Width(60));
+            string batchVersion = EditorGUILayout.TextField(defaultBundleVersion, GUILayout.Width(80));
+            if (GUILayout.Button("应用到全部", GUILayout.Width(80)))
             {
-                SetAllToHighestPriority();
+                SetAllBundleVersions(batchVersion);
             }
 
-            if (GUILayout.Button("全部设为最低优先级", GUILayout.Width(150)))
+            if (GUILayout.Button("应用到启用更新的", GUILayout.Width(120)))
             {
-                SetAllToLowestPriority();
-            }
-
-            if (GUILayout.Button("按当前顺序重排优先级", GUILayout.Width(150)))
-            {
-                ReassignPrioritiesByOrder();
+                SetEnabledBundleVersions(batchVersion);
             }
 
             EditorGUILayout.EndHorizontal();
+
 
             // 创建滚动视图来显示AB包列表
             scrollPosition = EditorGUILayout.BeginScrollView(scrollPosition, GUILayout.Height(300));
@@ -755,7 +853,11 @@ namespace AssetBundleHotUpdate
                 EditorGUILayout.BeginHorizontal();
                 EditorGUILayout.LabelField($"[{i + 1}]", GUILayout.Width(30));
                 EditorGUILayout.LabelField($"名称: {bundle.bundleName}", GUILayout.Width(180));
-                EditorGUILayout.LabelField($"版本: {bundle.version}", GUILayout.Width(100));
+
+// 版本号改为可编辑字段 - 这里就是单独设置版本号的地方
+                EditorGUILayout.LabelField("版本:", GUILayout.Width(35));
+                bundle.version = EditorGUILayout.TextField(bundle.version, GUILayout.Width(65));
+
                 EditorGUILayout.LabelField($"大小: {FormatFileSize(bundle.size)}", GUILayout.Width(100));
                 bundle.enableUpdate = EditorGUILayout.Toggle("启用更新", bundle.enableUpdate, GUILayout.Width(80));
                 EditorGUILayout.EndHorizontal();
@@ -966,6 +1068,47 @@ namespace AssetBundleHotUpdate
                     bundle.priority = i;
                 }
             }
+        }
+
+        #endregion
+
+        #region 版本号管理功能
+
+        /// <summary>
+        /// 设置所有AB包的版本号
+        /// </summary>
+        void SetAllBundleVersions(string version)
+        {
+            if (bundleManifest?.assetBundles == null || string.IsNullOrEmpty(version)) return;
+
+            foreach (var bundle in bundleManifest.assetBundles)
+            {
+                bundle.version = version;
+            }
+
+            Debug.Log($"已将所有AB包版本号设置为: {version}");
+            Repaint();
+        }
+
+        /// <summary>
+        /// 设置启用更新的AB包的版本号
+        /// </summary>
+        void SetEnabledBundleVersions(string version)
+        {
+            if (bundleManifest?.assetBundles == null || string.IsNullOrEmpty(version)) return;
+
+            int count = 0;
+            foreach (var bundle in bundleManifest.assetBundles)
+            {
+                if (bundle.enableUpdate)
+                {
+                    bundle.version = version;
+                    count++;
+                }
+            }
+
+            Debug.Log($"已将 {count} 个启用更新的AB包版本号设置为: {version}");
+            Repaint();
         }
 
         #endregion
