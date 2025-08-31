@@ -22,9 +22,7 @@ namespace QHotUpdateSystem.Editor.Config
       [Header("压缩设置")]
       public CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None;
 
-      /// <summary>
-      /// 获取压缩算法字符串
-      /// </summary>
+      /// <summary>获取压缩算法字符串</summary>
       public string GetCompressionAlgoString()
       {
           switch (compressionAlgorithm)
@@ -36,16 +34,23 @@ namespace QHotUpdateSystem.Editor.Config
           }
       }
 
-      /// <summary>
-      /// 是否启用了压缩
-      /// </summary>
+      /// <summary>是否启用了压缩</summary>
       public bool IsCompressionEnabled => compressionAlgorithm != CompressionAlgorithm.None;
+
+      [Header("Bundle 依赖拓扑 (构建期)")]
+      [Tooltip("是否生成 Unity AssetBundle 依赖拓扑并写入版本文件")]
+      public bool enableBundleDependency = true;
+
+      [Tooltip("Unity BuildPipeline.BuildAssetBundles 输出目录（可相对工程根或绝对路径），用于读取主 manifest")]
+      public string unityManifestPath = "AssetBundles/StandaloneWindows64";
+
+      [Tooltip("主 Manifest AssetBundle 名称（通常与平台目录同名）")]
+      public string unityManifestName = "StandaloneWindows64";
   }
 
 #if UNITY_EDITOR
   public static class HotUpdateConfigCreator
   {
-      // priority 0 放在 Create 子菜单靠前位置
       [UnityEditor.MenuItem("Assets/Create/QHotUpdate/Config Asset", false, 0)]
       public static void Create()
       {

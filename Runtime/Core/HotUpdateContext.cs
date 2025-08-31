@@ -1,11 +1,12 @@
 ﻿using System.Collections.Generic;
 using QHotUpdateSystem.Version;
 using QHotUpdateSystem.Platform;
+using QHotUpdateSystem.Dependency;
 
 namespace QHotUpdateSystem.Core
 {
     /// <summary>
-    /// 运行期上下文：集中存放初始化后共享对象
+    /// 运行期上下文（新增 Bundle 依赖解析相关字段）
     /// </summary>
     public class HotUpdateContext
     {
@@ -18,6 +19,13 @@ namespace QHotUpdateSystem.Core
             new Dictionary<string, ModuleRuntimeState>();
 
         public readonly Utility.IJsonSerializer JsonSerializer;
+
+        // ★ 新增：bundle -> module 映射
+        public readonly Dictionary<string, string> BundleToModule =
+            new Dictionary<string, string>(System.StringComparer.OrdinalIgnoreCase);
+
+        // ★ 新增：依赖解析器（可能为 null）
+        public BundleDependencyResolver BundleResolver;
 
         public HotUpdateContext(HotUpdateInitOptions options)
         {
