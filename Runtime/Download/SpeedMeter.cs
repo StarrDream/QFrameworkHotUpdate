@@ -1,37 +1,47 @@
 ﻿using System.Collections.Generic;
+using System.Diagnostics;
+using System.Threading;
 
 namespace QHotUpdateSystem.Download
 {
     /// <summary>
-    /// 速率统计：维护最近 windowSeconds 内的字节采样
+    /// 速率统计（线程安全版）：
+    /// - 使用 Stopwatch 而非 UnityEngine.Time，避免后台线程访问主线程 API。
+    /// - 记录窗口期内的字节总量 => 平均速度 = sum / windowSeconds。
+    /// - 多线程调用 AddSample 安全：使用简易锁或 Interlocked（此处用锁保持实现直观）。
     /// </summary>
     public class SpeedMeter
     {
-        private readonly float _windowSeconds;
-        private readonly Queue<(long bytes, float time)> _samples = new Queue<(long, float)>();
+        private readonly double _windowSeconds;
+        private readonly Queue<(long bytes, double timeSec)> _samples = new Queue<(long, double)>();
         private long _sum;
-        private float _time;
+        private readonly object _lock = new object();
+        private readonly Stopwatch _watch;
 
-        public SpeedMeter(float windowSeconds = 3f)
+        public SpeedMeter(double windowSeconds = 3d)
         {
-            _windowSeconds = windowSeconds;
+            _windowSeconds = windowSeconds <= 0 ? 3d : windowSeconds;
+            _watch = Stopwatch.StartNew();
         }
 
         public void AddSample(long bytes)
         {
             if (bytes <= 0) return;
-            _time += UnityEngine.Time.unscaledDeltaTime;
-            _samples.Enqueue((bytes, _time));
-            _sum += bytes;
-            Cleanup();
+            var now = _watch.Elapsed.TotalSeconds;
+            lock (_lock)
+            {
+                _samples.Enqueue((bytes, now));
+                _sum += bytes;
+                Cleanup(now);
+            }
         }
 
-        void Cleanup()
+        private void Cleanup(double now)
         {
             while (_samples.Count > 0)
             {
                 var head = _samples.Peek();
-                if (_time - head.time > _windowSeconds)
+                if (now - head.timeSec > _windowSeconds)
                 {
                     _samples.Dequeue();
                     _sum -= head.bytes;
@@ -42,8 +52,13 @@ namespace QHotUpdateSystem.Download
 
         public float GetSpeed()
         {
-            Cleanup();
-            return _windowSeconds > 0 ? _sum / _windowSeconds : 0f;
+            var now = _watch.Elapsed.TotalSeconds;
+            lock (_lock)
+            {
+                Cleanup(now);
+                if (_windowSeconds <= 0) return 0f;
+                return (float)(_sum / _windowSeconds);
+            }
         }
     }
 }

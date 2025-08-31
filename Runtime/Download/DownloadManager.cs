@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
+using System.Diagnostics;
 using QHotUpdateSystem.Core;
 using QHotUpdateSystem.Version;
 using QHotUpdateSystem.Persistence;
@@ -11,13 +12,14 @@ using QHotUpdateSystem.EventsSystem;
 using QHotUpdateSystem.Events;
 using QHotUpdateSystem.Security;
 using QHotUpdateSystem.Compression;
-using QHotUpdateSystem.Download;
 using QHotUpdateSystem.State;
+using QHotUpdateSystem.Diagnostics;
 
 namespace QHotUpdateSystem.Download
 {
     /// <summary>
-    /// 下载管理器（加入断点续传逻辑）
+    /// 下载管理器（Batch4：优先级 Aging + 诊断快照 + 文件错误事件）
+    /// 基于 Batch3 版本增量修改。
     /// </summary>
     public class DownloadManager
     {
@@ -38,6 +40,29 @@ namespace QHotUpdateSystem.Download
         private readonly HashSet<string> _activeTempFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, DownloadTask> _pendingByTemp = new Dictionary<string, DownloadTask>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<DownloadTask, List<DownloadTask>> _mergedFollowers = new Dictionary<DownloadTask, List<DownloadTask>>();
+
+        private readonly object _sync = new object();
+        private static readonly object _versionWriteLock = new object();
+
+        // Progress 节流（沿用 Batch3）
+        private readonly Stopwatch _progressWatch = Stopwatch.StartNew();
+        private double _lastGlobalEmitSec;
+        private readonly Dictionary<string, double> _lastModuleEmitSec = new Dictionary<string, double>();
+        private double _lastFileEmitSec;
+        private const double ProgressEmitIntervalSec = 0.06;
+
+        // Aging & 诊断
+        private readonly Stopwatch _agingWatch = Stopwatch.StartNew();
+        private double _lastAgingRebuildSec;
+        private double _lastDiagnosticsEmitSec;
+        private const double DiagnosticsIntervalSec = 3.0;
+
+        // Aging 策略参数（可后续外部化）
+        private const double AgingCheckIntervalSec = 5.0;
+        private const double AgingWaitThresholdSec = 15.0;
+        private const double AgingStepSec = 10.0; // 每等待10秒再额外提升一次
+        // Priority 数值假设：数值越小优先级越高（与之前逻辑保持）
+        // Aging 时将 Priority 数值递减直到最高手动限制
 
         public IVersionSignatureVerifier VersionVerifier;
         public bool IsBusy => _loopActive;
@@ -78,8 +103,8 @@ namespace QHotUpdateSystem.Download
             state.TotalFiles = safeFiles.Count;
             state.TotalBytes = safeFiles.Sum(f => f.compressed ? f.cSize : f.size);
 
-            // 全局总字节：加入本模块（后续再减去 resume 已有部分）
-            _globalTotalBytes += state.TotalBytes;
+            lock (_sync) { _globalTotalBytes += state.TotalBytes; }
+
             HotUpdateEvents.InvokeModuleStatus(moduleName, ModuleStatus.Updating);
 
             foreach (var f in safeFiles)
@@ -87,7 +112,6 @@ namespace QHotUpdateSystem.Download
                 string temp = _storage.GetTempFile(moduleName, f.name, f.hash);
                 string final = _storage.GetAssetPath(f.name);
                 string remoteUrl = _context.PlatformAdapter.GetRemoteAssetFileUrl(_context.Options.BaseUrl, f.name);
-
                 long expected = f.compressed ? f.cSize : f.size;
                 long existing = 0;
 
@@ -106,7 +130,6 @@ namespace QHotUpdateSystem.Download
                     catch { existing = 0; }
                 }
 
-                // Meta 校验：若不匹配 hash/algo/size 则丢弃
                 var metaPath = _storage.GetResumeMetaPath(moduleName, f.name, f.hash);
                 if (existing > 0)
                 {
@@ -132,9 +155,8 @@ namespace QHotUpdateSystem.Download
 
                 if (existing > 0)
                 {
-                    // 统计逻辑：全局 & 模块下载进度预先加
                     state.DownloadedBytes += existing;
-                    _globalDownloadedBytes += existing;
+                    lock (_sync) { _globalDownloadedBytes += existing; }
                 }
 
                 var task = new DownloadTask
@@ -147,10 +169,10 @@ namespace QHotUpdateSystem.Download
                     TotalBytes = expected,
                     ExistingBytes = existing,
                     Priority = priority,
+                    OriginalPriority = priority,
                     SupportResume = true,
                     ResumeMetaPath = metaPath
                 };
-
                 EnqueueTask(task);
             }
 
@@ -173,7 +195,7 @@ namespace QHotUpdateSystem.Download
             ExtendedDownloadEvents.InvokeModuleResumed(module);
             if (_controller.StateMachine.Current == DownloadState.Paused)
                 _controller.StateMachine.TryTransition(DownloadState.Running);
-            if (!_loopActive && (_queuedTasks.Count > 0 || _running.Count > 0))
+            if (!_loopActive)
                 _ = ProcessLoop();
         }
 
@@ -197,22 +219,25 @@ namespace QHotUpdateSystem.Download
 
         private void EnqueueTask(DownloadTask task)
         {
-            if (_pendingByTemp.TryGetValue(task.TempPath, out var existingPrimary))
+            lock (_sync)
             {
-                HotUpdateLogger.Info($"Merge duplicate task into primary: {task.File.name} temp={task.TempPath}");
-                if (!_mergedFollowers.TryGetValue(existingPrimary, out var list))
+                if (_pendingByTemp.TryGetValue(task.TempPath, out var existingPrimary))
                 {
-                    list = new List<DownloadTask>();
-                    _mergedFollowers[existingPrimary] = list;
+                    HotUpdateLogger.Info($"Merge duplicate task into primary: {task.File.name} temp={task.TempPath}");
+                    if (!_mergedFollowers.TryGetValue(existingPrimary, out var list))
+                    {
+                        list = new List<DownloadTask>();
+                        _mergedFollowers[existingPrimary] = list;
+                    }
+                    list.Add(task);
+                    task.State = DownloadTaskState.Queued;
+                    return;
                 }
-                list.Add(task);
-                task.State = DownloadTaskState.Queued;
-                return;
+                task.EnqueueTimeSec = _agingWatch.Elapsed.TotalSeconds;
+                _pendingByTemp[task.TempPath] = task;
+                _queue.Enqueue((int)task.Priority, task);
+                _queuedTasks.Add(task);
             }
-
-            _pendingByTemp[task.TempPath] = task;
-            _queue.Enqueue((int)task.Priority, task);
-            _queuedTasks.Add(task);
         }
 
         private async Task ProcessLoop()
@@ -233,53 +258,62 @@ namespace QHotUpdateSystem.Download
                         break;
                     }
 
-                    bool idle = _queue.Count == 0 && _running.Count == 0;
-                    if (idle) break;
+                    MaybeRebuildQueueForAging();
+                    MaybeEmitDiagnosticsSnapshot();
 
-                    bool allPaused = AreAllQueuedModulesPaused() && _running.Count == 0;
-                    if (allPaused)
+                    DownloadTask toStart = null;
+                    lock (_sync)
                     {
-                        await Task.Delay(200);
-                        continue;
+                        bool idle = _queue.Count == 0 && _running.Count == 0;
+                        if (idle) break;
+
+                        bool allPaused = AreAllQueuedModulesPausedLocked() && _running.Count == 0;
+                        if (!allPaused && _running.Count < _context.Options.MaxConcurrent && _queue.Count > 0)
+                        {
+                            var next = _queue.Dequeue();
+                            _queuedTasks.Remove(next);
+
+                            if (_controller.IsModuleCanceled(next.Module))
+                            {
+                                next.State = DownloadTaskState.Canceled;
+                                MarkPrimaryAndFollowersFailedOrCanceled(next, true);
+                            }
+                            else if (_controller.IsModulePaused(next.Module))
+                            {
+                                // 放回（降低优先级不再需要，维持现有）
+                                _queue.Enqueue((int)next.Priority, next);
+                                _queuedTasks.Add(next);
+                            }
+                            else
+                            {
+                                _running.Add(next);
+                                toStart = next;
+                            }
+                        }
                     }
 
-                    while (_running.Count < _context.Options.MaxConcurrent && _queue.Count > 0)
-                    {
-                        var next = _queue.Dequeue();
-                        _queuedTasks.Remove(next);
-                        if (_controller.IsModuleCanceled(next.Module))
-                        {
-                            next.State = DownloadTaskState.Canceled;
-                            ExtendedDownloadEvents.InvokeModuleCanceled(next.Module);
-                            MarkPrimaryAndFollowersFailedOrCanceled(next, canceled: true);
-                            continue;
-                        }
-                        if (_controller.IsModulePaused(next.Module))
-                        {
-                            next.Priority = (DownloadPriority)Math.Max((int)next.Priority - 1, (int)DownloadPriority.Low);
-                            EnqueueTask(next);
-                            break;
-                        }
-
-                        _running.Add(next);
-                        _ = RunTaskAsync(next);
-                    }
+                    if (toStart != null)
+                        _ = RunTaskAsync(toStart);
 
                     await Task.Delay(50);
                 }
             }
             finally
             {
-                if (_queue.Count == 0 && _running.Count == 0)
+                bool finished;
+                lock (_sync) { finished = _queue.Count == 0 && _running.Count == 0; }
+                if (finished)
                 {
                     _controller.StateMachine.TryTransition(DownloadState.Completed);
+                    ForceEmitGlobalProgress();
+                    EmitFinalDiagnosticsSnapshot();
                     HotUpdateEvents.InvokeAllTasksCompleted();
                 }
                 _loopActive = false;
             }
         }
 
-        private bool AreAllQueuedModulesPaused()
+        private bool AreAllQueuedModulesPausedLocked()
         {
             if (_queuedTasks.Count == 0) return true;
             foreach (var t in _queuedTasks)
@@ -295,16 +329,32 @@ namespace QHotUpdateSystem.Download
         private async Task RunTaskAsync(DownloadTask task)
         {
             task.State = DownloadTaskState.Running;
-
-            if (!_activeTempFiles.Add(task.TempPath))
+            lock (_sync)
             {
-                HotUpdateLogger.Warn("Temp already active (race) -> skipping: " + task.TempPath);
-                task.State = DownloadTaskState.Canceled;
-                FinishTask(task);
-                return;
+                if (!_activeTempFiles.Add(task.TempPath))
+                {
+                    HotUpdateLogger.Warn("Temp already active (race) -> skipping: " + task.TempPath);
+                    task.State = DownloadTaskState.Canceled;
+                    FinishTask(task);
+                    return;
+                }
             }
 
-            // 若已有部分且 meta 不存在，生成 meta
+            var head = await HttpDownloader.HeadAsync(task.RemoteUrl, _context.Options.TimeoutSeconds);
+            if (head.Ok && !head.AcceptRanges)
+            {
+                task.SupportResume = false;
+                if (task.ExistingBytes > 0)
+                {
+                    TryDelete(task.TempPath);
+                    TryDelete(task.ResumeMetaPath);
+                    task.ExistingBytes = 0;
+                }
+            }
+
+            if (!task.IsCompressed && task.ExistingBytes == 0)
+                task.IncrementalHash = IncrementalHashWrapper.Create(_context.Options.HashAlgo);
+
             if (task.SupportResume && task.ExistingBytes > 0 && !File.Exists(task.ResumeMetaPath))
             {
                 var meta = DownloadResumeMeta.Create(task.File, task.RemoteUrl, _context.Options.HashAlgo);
@@ -312,19 +362,24 @@ namespace QHotUpdateSystem.Download
             }
 
             int maxRetry = _context.Options.MaxRetry;
-            for (; task.RetryCount <= maxRetry; task.RetryCount++)
+            int maxIntegrityRetry = Math.Max(1, Math.Min(2, maxRetry));
+            bool finished = false;
+
+            for (; task.RetryCount <= maxRetry && !finished; task.RetryCount++)
             {
                 if (_controller.IsModuleCanceled(task.Module))
                 {
                     task.State = DownloadTaskState.Canceled;
-                    MarkPrimaryAndFollowersFailedOrCanceled(task, canceled: true);
+                    task.ErrorCode = DownloadErrorCode.Canceled;
+                    MarkPrimaryAndFollowersFailedOrCanceled(task, true);
+                    HotUpdateEvents.InvokeFileError(task.Module, task.File.name, task.ErrorCode, "Canceled");
                     break;
                 }
 
-                long sessionStartExisting = task.ExistingBytes;
-                long sessionIncr = 0;
+                long attemptDelta = 0;
+                var moduleState = _context.ModuleStates[task.Module];
 
-                bool ok = await HttpDownloader.DownloadFile(
+                var netResult = await HttpDownloader.DownloadFile(
                     task,
                     task.RemoteUrl,
                     task.TempPath,
@@ -334,14 +389,14 @@ namespace QHotUpdateSystem.Download
                         OnDelta = delta =>
                         {
                             task.DownloadedBytes += delta;
-                            sessionIncr += delta;
-                            var moduleState = _context.ModuleStates[task.Module];
+                            attemptDelta += delta;
                             moduleState.DownloadedBytes += delta;
-                            _globalDownloadedBytes += delta;
+                            lock (_sync) { _globalDownloadedBytes += delta; }
                             _globalSpeed.AddSample(delta);
-                            EmitProgress(task, moduleState);
+                            EmitProgressThrottled(task, moduleState, force: false);
                             return true;
                         },
+                        OnChunk = (buf, ofs, cnt) => task.IncrementalHash?.Append(buf, ofs, cnt),
                         ShouldAbort = () => _controller.ShouldAbort(task.Module, _controller.GlobalToken),
                         OnPauseWait = () => _controller.WaitIfPaused(task.Module, _controller.GlobalToken),
                         SupportResume = task.SupportResume,
@@ -350,56 +405,86 @@ namespace QHotUpdateSystem.Download
                         RemoteUrl = task.RemoteUrl
                     });
 
-                if (ok)
+                if (netResult.Aborted)
                 {
-                    task.ExistingBytes += sessionIncr; // 已写入部分变成新的 existing
-                    // 每轮成功后立即写 meta（如果支持）
-                    if (task.SupportResume)
-                    {
-                        var meta = DownloadResumeMeta.Create(task.File, task.RemoteUrl, _context.Options.HashAlgo);
-                        meta.Save(task.ResumeMetaPath);
-                    }
+                    task.State = DownloadTaskState.Canceled;
+                    task.ErrorCode = DownloadErrorCode.Canceled;
+                    MarkPrimaryAndFollowersFailedOrCanceled(task, true);
+                    HotUpdateEvents.InvokeFileError(task.Module, task.File.name, task.ErrorCode, "Aborted");
+                    break;
+                }
 
-                    if (task.ExistingBytes >= task.TotalBytes)
+                if (!netResult.Succeeded)
+                {
+                    task.State = DownloadTaskState.Failed;
+                    task.ErrorCode = netResult.ErrorCode == DownloadErrorCode.None ? DownloadErrorCode.Network : netResult.ErrorCode;
+                    task.LastError = netResult.ErrorMessage;
+                    bool retryable = task.RetryCount < maxRetry;
+                    StructuredLogger.Log(StructuredLogger.Level.Warn, "Download network fail",
+                        new { task.Module, File = task.File.name, task.RetryCount, task.ErrorCode, task.LastError, retryable });
+
+                    if (retryable)
                     {
-                        if (await FinalizeFile(task))
-                        {
-                            task.State = DownloadTaskState.Completed;
-                            var moduleState = _context.ModuleStates[task.Module];
-                            moduleState.CompletedFiles++;
-                            EmitProgress(task, moduleState);
-                            PropagateFollowersSuccess(task);
-                            break;
-                        }
-                        else
-                        {
-                            task.State = DownloadTaskState.Failed;
-                        }
+                        EmitProgressThrottled(task, moduleState, force: true);
+                        await RetryPolicy.DelayForRetry(task.RetryCount);
+                        continue;
                     }
+                    moduleState.FailedFiles++;
+                    moduleState.LastError = task.LastError;
+                    EmitProgressThrottled(task, moduleState, force: true);
+                    HotUpdateEvents.InvokeError(task.Module, $"File {task.File.name} failed (network): {task.LastError}");
+                    HotUpdateEvents.InvokeFileError(task.Module, task.File.name, task.ErrorCode, task.LastError);
+                    PropagateFollowersFailure(task);
+                    break;
+                }
+
+                var fin = await FinalizeFile(task, attemptDelta, moduleState);
+                if (fin.Success)
+                {
+                    task.State = DownloadTaskState.Completed;
+                    task.ErrorCode = DownloadErrorCode.None;
+                    moduleState.CompletedFiles++;
+                    EmitProgressThrottled(task, moduleState, force: true);
+                    PropagateFollowersSuccess(task);
+                    finished = true;
+                    break;
                 }
                 else
                 {
                     task.State = DownloadTaskState.Failed;
-                }
+                    task.ErrorCode = fin.ErrorCode;
+                    task.LastError = fin.ErrorMessage;
 
-                if (_controller.IsModuleCanceled(task.Module))
-                {
-                    task.State = DownloadTaskState.Canceled;
-                    MarkPrimaryAndFollowersFailedOrCanceled(task, canceled: true);
-                    break;
-                }
+                    StructuredLogger.Log(StructuredLogger.Level.Warn, "Finalize fail",
+                        new { task.Module, File = task.File.name, task.ErrorCode, task.LastError, attemptDelta, task.RetryCount, task.IntegrityRetryCount });
 
-                if (task.State == DownloadTaskState.Failed && task.RetryCount < maxRetry)
-                {
-                    await RetryPolicy.DelayForRetry(task.RetryCount);
-                }
-                else if (task.State == DownloadTaskState.Failed)
-                {
-                    var moduleState = _context.ModuleStates[task.Module];
+                    if ((fin.ErrorCode == DownloadErrorCode.IntegrityMismatch || fin.ErrorCode == DownloadErrorCode.DecompressFail))
+                    {
+                        if (fin.TempInvalidated && attemptDelta > 0)
+                        {
+                            task.DownloadedBytes -= attemptDelta;
+                            moduleState.DownloadedBytes -= attemptDelta;
+                            lock (_sync) { _globalDownloadedBytes -= attemptDelta; }
+                            if (task.DownloadedBytes < 0) task.DownloadedBytes = 0;
+                            if (moduleState.DownloadedBytes < 0) moduleState.DownloadedBytes = 0;
+                        }
+                        task.IntegrityRetryCount++;
+                        bool retryable = task.IntegrityRetryCount <= maxIntegrityRetry && task.RetryCount < maxRetry;
+                        if (retryable)
+                        {
+                            EmitProgressThrottled(task, moduleState, force: true);
+                            await RetryPolicy.DelayForRetry(task.RetryCount);
+                            continue;
+                        }
+                    }
+
                     moduleState.FailedFiles++;
                     moduleState.LastError = task.LastError;
-                    HotUpdateEvents.InvokeError(task.Module, $"File {task.File.name} failed: {task.LastError}");
+                    EmitProgressThrottled(task, moduleState, force: true);
+                    HotUpdateEvents.InvokeError(task.Module, $"File {task.File.name} failed ({task.ErrorCode}): {task.LastError}");
+                    HotUpdateEvents.InvokeFileError(task.Module, task.File.name, task.ErrorCode, task.LastError);
                     PropagateFollowersFailure(task);
+                    break;
                 }
             }
 
@@ -409,30 +494,33 @@ namespace QHotUpdateSystem.Download
 
         private void FinishTask(DownloadTask task)
         {
-            _running.Remove(task);
-            _completed.Add(task);
-            _activeTempFiles.Remove(task.TempPath);
-            _pendingByTemp.Remove(task.TempPath);
-            _mergedFollowers.Remove(task);
+            lock (_sync)
+            {
+                _running.Remove(task);
+                _completed.Add(task);
+                _activeTempFiles.Remove(task.TempPath);
+                _pendingByTemp.Remove(task.TempPath);
+                _mergedFollowers.Remove(task);
+            }
         }
 
-        private async Task<bool> FinalizeFile(DownloadTask task)
+        private async Task<FinalizeResult> FinalizeFile(DownloadTask task, long attemptDelta, ModuleRuntimeState moduleState)
         {
             try
             {
                 if (!FileNameValidator.IsSafeRelativeName(task.File.name))
-                {
-                    task.LastError = "Unsafe file name (rejected)";
-                    return false;
-                }
+                    return FinalizeResult.Fail(DownloadErrorCode.UnsafePath, "Unsafe file name", true);
 
                 if (!FileNameValidator.IsPathWithinRoot(_storage.AssetDirFullPath, task.FinalPath))
-                {
-                    task.LastError = "Target path outside asset root";
-                    return false;
-                }
+                    return FinalizeResult.Fail(DownloadErrorCode.UnsafePath, "Target path outside asset root", true);
 
-                // 如果最终文件已存在且 hash 已匹配，可直接成功
+                var tempInfo = new FileInfo(task.TempPath);
+                if (!tempInfo.Exists)
+                    return FinalizeResult.Fail(DownloadErrorCode.IO, "Temp missing", true);
+
+                if (tempInfo.Length != task.TotalBytes)
+                    return FinalizeResult.Fail(DownloadErrorCode.IO, $"Length mismatch expect={task.TotalBytes} got={tempInfo.Length}", true);
+
                 if (File.Exists(task.FinalPath))
                 {
                     using (var existStream = File.OpenRead(task.FinalPath))
@@ -440,68 +528,70 @@ namespace QHotUpdateSystem.Download
                         var existingHash = HashUtility.ComputeStream(existStream, _context.Options.HashAlgo);
                         if (string.Equals(existingHash, task.File.hash, StringComparison.OrdinalIgnoreCase))
                         {
-                            if (File.Exists(task.TempPath))
-                                SafeDelete(task.TempPath);
+                            SafeDelete(task.TempPath);
                             TryDelete(task.ResumeMetaPath);
-                            return true;
+                            task.OnCompleted?.Invoke(task);
+                            return FinalizeResult.Ok();
                         }
                     }
                     SafeDelete(task.FinalPath);
                 }
 
-                // 如果临时文件大小与期望不符则失败（可能被服务器截断）
-                var tempLen = new FileInfo(task.TempPath).Length;
-                if (tempLen != task.TotalBytes)
-                {
-                    task.LastError = $"Temp length mismatch expect={task.TotalBytes} got={tempLen}";
-                    return false;
-                }
+                string finalTemp = task.FinalPath + ".dl_tmp";
+                if (File.Exists(finalTemp)) SafeDelete(finalTemp);
+
+                string computedHash = null;
 
                 if (task.IsCompressed)
                 {
                     var comp = CompressorRegistry.Get(task.File.algo);
                     if (comp == null)
-                    {
-                        task.LastError = "No compressor: " + task.File.algo;
-                        return false;
-                    }
-                    if (!comp.Decompress(task.TempPath, task.FinalPath, out var derr))
-                    {
-                        task.LastError = "Decompress fail: " + derr;
-                        return false;
-                    }
+                        return FinalizeResult.Fail(DownloadErrorCode.DecompressFail, "No compressor: " + task.File.algo, true);
+
+                    if (!comp.Decompress(task.TempPath, finalTemp, out var derr))
+                        return FinalizeResult.Fail(DownloadErrorCode.DecompressFail, "Decompress fail: " + derr, false);
+
+                    using (var fs = File.OpenRead(finalTemp))
+                        computedHash = HashUtility.ComputeStream(fs, _context.Options.HashAlgo);
                 }
                 else
                 {
-                    if (File.Exists(task.FinalPath))
-                        SafeDelete(task.FinalPath);
-                    File.Move(task.TempPath, task.FinalPath);
-                }
-
-                using (var fs = File.OpenRead(task.FinalPath))
-                {
-                    var hash = HashUtility.ComputeStream(fs, _context.Options.HashAlgo);
-                    if (!string.Equals(hash, task.File.hash, StringComparison.OrdinalIgnoreCase))
+                    if (task.IncrementalHash != null && task.ExistingBytes == 0)
                     {
-                        task.LastError = $"Hash mismatch expect={task.File.hash} got={hash}";
-                        SafeDelete(task.FinalPath);
-                        if (task.IsCompressed && File.Exists(task.TempPath))
-                            SafeDelete(task.TempPath);
-                        return false;
+                        task.IncrementalHashHex = task.IncrementalHash.FinalHex();
+                        computedHash = task.IncrementalHashHex;
+                        File.Copy(task.TempPath, finalTemp, true);
+                    }
+                    else
+                    {
+                        File.Copy(task.TempPath, finalTemp, true);
+                        using (var fs = File.OpenRead(finalTemp))
+                            computedHash = HashUtility.ComputeStream(fs, _context.Options.HashAlgo);
                     }
                 }
 
-                if (File.Exists(task.TempPath))
+                if (!string.Equals(computedHash, task.File.hash, StringComparison.OrdinalIgnoreCase))
+                {
+                    SafeDelete(finalTemp);
                     SafeDelete(task.TempPath);
+                    TryDelete(task.ResumeMetaPath);
+                    return FinalizeResult.Fail(DownloadErrorCode.IntegrityMismatch,
+                        $"Hash mismatch expect={task.File.hash} got={computedHash}", true);
+                }
+
+                if (File.Exists(task.FinalPath))
+                    SafeDelete(task.FinalPath);
+                File.Move(finalTemp, task.FinalPath);
+
+                SafeDelete(task.TempPath);
                 TryDelete(task.ResumeMetaPath);
 
                 task.OnCompleted?.Invoke(task);
-                return true;
+                return FinalizeResult.Ok();
             }
             catch (Exception e)
             {
-                task.LastError = e.Message;
-                return false;
+                return FinalizeResult.Fail(DownloadErrorCode.Unknown, e.Message, false);
             }
             finally
             {
@@ -511,15 +601,8 @@ namespace QHotUpdateSystem.Download
 
         private void SafeDelete(string path)
         {
-            try
-            {
-                if (File.Exists(path))
-                    File.Delete(path);
-            }
-            catch (Exception e)
-            {
-                HotUpdateLogger.Warn("SafeDelete failed: " + path + " err=" + e.Message);
-            }
+            try { if (File.Exists(path)) File.Delete(path); }
+            catch (Exception e) { HotUpdateLogger.Warn("SafeDelete failed: " + path + " err=" + e.Message); }
         }
 
         #endregion
@@ -528,90 +611,266 @@ namespace QHotUpdateSystem.Download
 
         private void PropagateFollowersSuccess(DownloadTask primary)
         {
-            if (!_mergedFollowers.TryGetValue(primary, out var list)) return;
-            foreach (var follower in list)
+            List<DownloadTask> followers = null;
+            lock (_sync)
+            {
+                if (!_mergedFollowers.TryGetValue(primary, out followers))
+                    return;
+            }
+            foreach (var follower in followers)
             {
                 follower.State = DownloadTaskState.Completed;
                 follower.DownloadedBytes = primary.DownloadedBytes;
                 follower.TotalBytes = primary.TotalBytes;
                 follower.LastError = null;
+                follower.ErrorCode = DownloadErrorCode.None;
 
                 if (_context.ModuleStates.TryGetValue(follower.Module, out var mState))
-                {
                     mState.CompletedFiles++;
-                    // follower 的 ExistingBytes 和 primary 一样，不重复统计
-                }
             }
-            _mergedFollowers.Remove(primary);
+            lock (_sync) { _mergedFollowers.Remove(primary); }
         }
 
         private void PropagateFollowersFailure(DownloadTask primary)
         {
-            if (!_mergedFollowers.TryGetValue(primary, out var list)) return;
-            foreach (var follower in list)
+            List<DownloadTask> followers = null;
+            lock (_sync)
+            {
+                if (!_mergedFollowers.TryGetValue(primary, out followers))
+                    return;
+            }
+            foreach (var follower in followers)
             {
                 follower.State = DownloadTaskState.Failed;
                 follower.LastError = primary.LastError;
+                follower.ErrorCode = primary.ErrorCode;
                 if (_context.ModuleStates.TryGetValue(follower.Module, out var mState))
                 {
                     mState.FailedFiles++;
                     mState.LastError = primary.LastError;
                 }
             }
-            _mergedFollowers.Remove(primary);
+            lock (_sync) { _mergedFollowers.Remove(primary); }
         }
 
         private void MarkPrimaryAndFollowersFailedOrCanceled(DownloadTask primary, bool canceled)
         {
-            if (_mergedFollowers.TryGetValue(primary, out var list))
+            List<DownloadTask> followers = null;
+            lock (_sync)
             {
-                foreach (var follower in list)
+                if (_mergedFollowers.TryGetValue(primary, out followers))
                 {
-                    follower.State = canceled ? DownloadTaskState.Canceled : DownloadTaskState.Failed;
-                    if (_context.ModuleStates.TryGetValue(follower.Module, out var mState))
+                    foreach (var follower in followers)
                     {
-                        if (!canceled) mState.FailedFiles++;
+                        follower.State = canceled ? DownloadTaskState.Canceled : DownloadTaskState.Failed;
+                        follower.ErrorCode = canceled ? DownloadErrorCode.Canceled : DownloadErrorCode.Unknown;
+                        if (_context.ModuleStates.TryGetValue(follower.Module, out var mState))
+                        {
+                            if (!canceled) mState.FailedFiles++;
+                        }
                     }
+                    _mergedFollowers.Remove(primary);
                 }
-                _mergedFollowers.Remove(primary);
             }
         }
 
         #endregion
 
-        #region Progress / Completion (保持原逻辑)
+        #region Progress Throttling
 
-        private void EmitProgress(DownloadTask task, ModuleRuntimeState moduleState)
+        private void EmitProgressThrottled(DownloadTask task, ModuleRuntimeState moduleState, bool force)
         {
-            var fInfo = new FileProgressInfo
-            {
-                Module = task.Module,
-                FileName = task.File.name,
-                Downloaded = task.ExistingBytes + task.DownloadedBytes,
-                Total = task.TotalBytes,
-                Speed = _globalSpeed.GetSpeed()
-            };
-            HotUpdateEvents.InvokeFileProgress(task.Module, fInfo);
+            var nowSec = _progressWatch.Elapsed.TotalSeconds;
+            bool emitFile = force || (nowSec - _lastFileEmitSec >= ProgressEmitIntervalSec);
+            _lastModuleEmitSec.TryGetValue(task.Module, out var lastModuleTs);
+            bool emitModule = force || (nowSec - lastModuleTs >= ProgressEmitIntervalSec);
+            bool emitGlobal = force || (nowSec - _lastGlobalEmitSec >= ProgressEmitIntervalSec);
+            if (!emitFile && !emitModule && !emitGlobal) return;
 
-            var mInfo = new ModuleProgressInfo
+            if (emitFile)
             {
-                Module = task.Module,
-                DownloadedBytes = moduleState.DownloadedBytes,
-                TotalBytes = moduleState.TotalBytes,
-                CompletedFiles = moduleState.CompletedFiles,
-                TotalFiles = moduleState.TotalFiles,
-                Speed = _globalSpeed.GetSpeed()
-            };
-            HotUpdateEvents.InvokeModuleProgress(task.Module, mInfo);
+                _lastFileEmitSec = nowSec;
+                var fInfo = new FileProgressInfo
+                {
+                    Module = task.Module,
+                    FileName = task.File.name,
+                    Downloaded = task.ExistingBytes + task.DownloadedBytes,
+                    Total = task.TotalBytes,
+                    Speed = _globalSpeed.GetSpeed()
+                };
+                HotUpdateEvents.InvokeFileProgress(task.Module, fInfo);
+            }
+            if (emitModule)
+            {
+                _lastModuleEmitSec[task.Module] = nowSec;
+                var mInfo = new ModuleProgressInfo
+                {
+                    Module = task.Module,
+                    DownloadedBytes = moduleState.DownloadedBytes,
+                    TotalBytes = moduleState.TotalBytes,
+                    CompletedFiles = moduleState.CompletedFiles,
+                    TotalFiles = moduleState.TotalFiles,
+                    Speed = _globalSpeed.GetSpeed()
+                };
+                HotUpdateEvents.InvokeModuleProgress(task.Module, mInfo);
+            }
+            if (emitGlobal)
+            {
+                _lastGlobalEmitSec = nowSec;
+                long gDown, gTot;
+                lock (_sync) { gDown = _globalDownloadedBytes; gTot = _globalTotalBytes; }
+                var gInfo = new GlobalProgressInfo
+                {
+                    DownloadedBytes = gDown,
+                    TotalBytes = gTot,
+                    Speed = _globalSpeed.GetSpeed()
+                };
+                HotUpdateEvents.InvokeGlobalProgress(gInfo);
+            }
+        }
 
+        private void ForceEmitGlobalProgress()
+        {
+            long gDown, gTot;
+            lock (_sync) { gDown = _globalDownloadedBytes; gTot = _globalTotalBytes; }
             var gInfo = new GlobalProgressInfo
             {
-                DownloadedBytes = _globalDownloadedBytes,
-                TotalBytes = _globalTotalBytes,
+                DownloadedBytes = gDown,
+                TotalBytes = gTot,
                 Speed = _globalSpeed.GetSpeed()
             };
             HotUpdateEvents.InvokeGlobalProgress(gInfo);
         }
+
+        #endregion
+
+        #region Diagnostics
+
+        private void MaybeEmitDiagnosticsSnapshot()
+        {
+            var now = _agingWatch.Elapsed.TotalSeconds;
+            if (now - _lastDiagnosticsEmitSec < DiagnosticsIntervalSec) return;
+            _lastDiagnosticsEmitSec = now;
+            EmitDiagnosticsSnapshot();
+        }
+
+        private void EmitFinalDiagnosticsSnapshot()
+        {
+            EmitDiagnosticsSnapshot();
+        }
+
+        private void EmitDiagnosticsSnapshot()
+        {
+            DownloadDiagnosticsSnapshot snap;
+            lock (_sync)
+            {
+                snap = new DownloadDiagnosticsSnapshot
+                {
+                    GlobalDownloadedBytes = _globalDownloadedBytes,
+                    GlobalTotalBytes = _globalTotalBytes,
+                    GlobalSpeed = _globalSpeed.GetSpeed(),
+                    QueuedCount = _queue.Count,
+                    RunningCount = _running.Count,
+                    CompletedCount = _completed.Count,
+                    Modules = _context.ModuleStates.Select(kv => new DownloadDiagnosticsSnapshot.ModuleSummary
+                    {
+                        Name = kv.Key,
+                        CompletedFiles = kv.Value.CompletedFiles,
+                        FailedFiles = kv.Value.FailedFiles,
+                        TotalFiles = kv.Value.TotalFiles,
+                        DownloadedBytes = kv.Value.DownloadedBytes,
+                        TotalBytes = kv.Value.TotalBytes,
+                        Status = kv.Value.Status.ToString()
+                    }).ToArray(),
+                    ActiveTasks = _running
+                        .Concat(_queuedTasks)
+                        .Select(t =>
+                        {
+                            double wait = t.State == DownloadTaskState.Queued
+                                ? (_agingWatch.Elapsed.TotalSeconds - t.EnqueueTimeSec)
+                                : 0;
+                            return new DownloadDiagnosticsSnapshot.TaskSummary
+                            {
+                                Module = t.Module,
+                                FileName = t.File.name,
+                                Downloaded = t.ExistingBytes + t.DownloadedBytes,
+                                Total = t.TotalBytes,
+                                State = t.State.ToString(),
+                                Priority = (int)t.Priority,
+                                OriginalPriority = (int)t.OriginalPriority,
+                                WaitSeconds = Math.Round(wait, 2),
+                                RetryCount = t.RetryCount,
+                                IntegrityRetry = t.IntegrityRetryCount,
+                                ErrorCode = t.ErrorCode.ToString()
+                            };
+                        }).ToArray()
+                };
+            }
+            HotUpdateEvents.InvokeDiagnostics(snap);
+        }
+
+        #endregion
+
+        #region Aging
+
+        private void MaybeRebuildQueueForAging()
+        {
+            var now = _agingWatch.Elapsed.TotalSeconds;
+            if (now - _lastAgingRebuildSec < AgingCheckIntervalSec) return;
+            _lastAgingRebuildSec = now;
+
+            List<DownloadTask> temp = null;
+            bool anyChanged = false;
+            lock (_sync)
+            {
+                if (_queue.Count == 0) return;
+
+                // 将队列全部取出缓存（保持 _queuedTasks 列表中顺序不重要）
+                temp = new List<DownloadTask>(_queue.Count);
+                while (_queue.Count > 0)
+                {
+                    var t = _queue.Dequeue();
+                    temp.Add(t);
+                }
+
+                foreach (var t in temp)
+                {
+                    if (t.State != DownloadTaskState.Queued)
+                    {
+                        // 仍可能在列表里（理论上不会）——过滤
+                        continue;
+                    }
+                    var wait = now - t.EnqueueTimeSec;
+                    if (wait < AgingWaitThresholdSec) continue;
+
+                    // Aging 计算：超过阈值后，每 AgingStepSec 提升一档
+                    int steps = (int)((wait - AgingWaitThresholdSec) / AgingStepSec) + 1;
+                    var old = (int)t.Priority;
+                    var newP = Math.Max(0, old - steps); // 0 视为最高
+                    if (newP != old)
+                    {
+                        t.Priority = (DownloadPriority)newP;
+                        anyChanged = true;
+                    }
+                }
+
+                // 重新入队，按更新后的 Priority
+                foreach (var t in temp)
+                {
+                    _queue.Enqueue((int)t.Priority, t);
+                }
+            }
+
+            if (anyChanged)
+            {
+                StructuredLogger.Log(StructuredLogger.Level.Info, "AgingRebuild",
+                    new { queueCount = temp.Count, time = now });
+            }
+        }
+
+        #endregion
+
+        #region Completion / Version
 
         private void CheckModuleComplete(string module)
         {
@@ -621,8 +880,11 @@ namespace QHotUpdateSystem.Download
                 if (mState.FailedFiles == 0)
                 {
                     var remoteModule = FindModule(_context.RemoteVersion, module);
-                    VersionWriter.UpsertModule(_context.LocalVersion, remoteModule);
-                    VersionLoader.SaveLocal(_context.PlatformAdapter.GetLocalVersionFilePath(), _context.LocalVersion, _context.JsonSerializer);
+                    lock (_versionWriteLock)
+                    {
+                        VersionWriter.UpsertModule(_context.LocalVersion, remoteModule);
+                        VersionLoader.SaveLocal(_context.PlatformAdapter.GetLocalVersionFilePath(), _context.LocalVersion, _context.JsonSerializer);
+                    }
                     mState.Status = ModuleStatus.Updated;
                     HotUpdateEvents.InvokeModuleStatus(module, ModuleStatus.Updated);
                 }
@@ -637,8 +899,11 @@ namespace QHotUpdateSystem.Download
 
         private void MarkModuleInstalled(ModuleInfo remoteModule)
         {
-            VersionWriter.UpsertModule(_context.LocalVersion, remoteModule);
-            VersionLoader.SaveLocal(_context.PlatformAdapter.GetLocalVersionFilePath(), _context.LocalVersion, _context.JsonSerializer);
+            lock (_versionWriteLock)
+            {
+                VersionWriter.UpsertModule(_context.LocalVersion, remoteModule);
+                VersionLoader.SaveLocal(_context.PlatformAdapter.GetLocalVersionFilePath(), _context.LocalVersion, _context.JsonSerializer);
+            }
             var state = _context.ModuleStates[remoteModule.name];
             state.Status = ModuleStatus.Installed;
             HotUpdateEvents.InvokeModuleStatus(remoteModule.name, ModuleStatus.Installed);
@@ -658,7 +923,7 @@ namespace QHotUpdateSystem.Download
 
         private void CleanupCancelFlags()
         {
-            // TODO: 可在此处清理未完成的 .part (策略: 保留用于 resume)
+            // 保留 .part 供后续恢复
         }
 
         private void TryDelete(string path)
