@@ -20,9 +20,9 @@ namespace QHotUpdateSystem.Download
 {
     /// <summary>
     /// 下载管理器
-    /// 1. Lazy Aging：全量重建 => 在实际出队启动时惰性调整优先级。
-    /// 2. CheckModuleComplete 在统一锁内读取统计，避免潜在竞态。
-    /// 3. FinalizeFile 结束后释放增量哈希对象，防止泄露。
+    /// ★ 本批次改动：
+    ///   1. 修复：模块文件重复（相同 name+hash）导致 alias 计数失衡，引起模块无法完成的问题 —— 现在预先去重，TotalFiles/TotalBytes 按唯一文件统计。
+    ///   2. 其它逻辑保持不变（后续批次再做性能和 HEAD 优化）。
     /// </summary>
     public class DownloadManager
     {
@@ -59,12 +59,12 @@ namespace QHotUpdateSystem.Download
         private double _lastDiagnosticsEmitSec;
         private const double DiagnosticsIntervalSec = 3.0;
 
-        // Lazy Aging 参数（替代原全量重建）
-        private const double AgingWaitThresholdSec = 15.0; // 等待超过该阈值才开始提升
-        private const double AgingStepSec = 10.0; // 每额外 AgingStepSec 提升一次
-        private const int AgingPriorityStep = 5; // 每次提升的优先级增量
+        // Lazy Aging 参数
+        private const double AgingWaitThresholdSec = 15.0;
+        private const double AgingStepSec = 10.0;
+        private const int AgingPriorityStep = 5;
 
-        // 事件驱动调度信号
+        // 调度信号
         private readonly SemaphoreSlim _loopSignal = new SemaphoreSlim(0, int.MaxValue);
         private const int LoopWaitTimeoutMs = 500;
 
@@ -104,9 +104,22 @@ namespace QHotUpdateSystem.Download
             state.Status = ModuleStatus.Updating;
             state.ResetProgress();
 
-            var safeFiles = changed.Where(f => FileNameValidator.IsSafeRelativeName(f.name)).ToList();
-            state.TotalFiles = safeFiles.Count;
-            state.TotalBytes = safeFiles.Sum(f => f.compressed ? f.cSize : f.size);
+            // 1) 过滤不安全文件
+            var safeFilesRaw = changed.Where(f => FileNameValidator.IsSafeRelativeName(f.name)).ToList();
+
+            // 2) ★ 去重：按 (name + hash) 唯一，避免同文件重复导致 alias 不计数阻塞完成判定
+            var unique = new List<FileEntry>();
+            var dedupSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var f in safeFilesRaw)
+            {
+                string key = f.name + "|" + f.hash;
+                if (dedupSet.Add(key))
+                    unique.Add(f);
+            }
+
+            // 3) 统计（只按唯一文件计数）
+            state.TotalFiles = unique.Count;
+            state.TotalBytes = unique.Sum(f => f.compressed ? f.cSize : f.size);
 
             lock (_sync)
             {
@@ -115,7 +128,7 @@ namespace QHotUpdateSystem.Download
 
             HotUpdateEvents.InvokeModuleStatus(moduleName, ModuleStatus.Updating);
 
-            foreach (var f in safeFiles)
+            foreach (var f in unique)
             {
                 string temp = _storage.GetTempFile(moduleName, f.name, f.hash);
                 string final = _storage.GetAssetPath(f.name);
@@ -294,7 +307,6 @@ namespace QHotUpdateSystem.Download
             {
                 while (true)
                 {
-                    // 1) 取消状态处理
                     if (_controller.StateMachine.Current == DownloadState.Canceling)
                     {
                         CleanupCancelFlags();
@@ -302,10 +314,8 @@ namespace QHotUpdateSystem.Download
                         break;
                     }
 
-                    // 2) 诊断周期事件
                     MaybeEmitDiagnosticsSnapshot();
 
-                    // 3) 尝试启动新的任务
                     DownloadTask toStart = null;
                     bool idle;
                     lock (_sync)
@@ -319,10 +329,8 @@ namespace QHotUpdateSystem.Download
                                 var next = _queue.Dequeue();
                                 _queuedTasks.Remove(next);
 
-                                // Lazy Aging：如果等待时间超阈值 => 动态调整优先级后再入队重试
                                 if (ApplyAgingPriority(next))
                                 {
-                                    // 重新入队后跳过本轮启动
                                     _queue.Enqueue((int)next.Priority, next);
                                     _queuedTasks.Add(next);
                                 }
@@ -334,7 +342,6 @@ namespace QHotUpdateSystem.Download
                                 }
                                 else if (_controller.IsModulePaused(next.Module))
                                 {
-                                    // 模块暂停，放回队列
                                     _queue.Enqueue((int)next.Priority, next);
                                     _queuedTasks.Add(next);
                                 }
@@ -353,7 +360,6 @@ namespace QHotUpdateSystem.Download
                     if (idle)
                         break;
 
-                    // 4) 等待唤醒或超时
                     await _loopSignal.WaitAsync(LoopWaitTimeoutMs);
                 }
             }
@@ -377,10 +383,6 @@ namespace QHotUpdateSystem.Download
             }
         }
 
-        /// <summary>
-        /// 惰性 Aging：若任务等待超阈值，则根据 (等待时间 - 阈值)/步长 计算应提升的优先级。
-        /// 返回 true 表示已调整优先级（需要重新入队）。
-        /// </summary>
         private bool ApplyAgingPriority(DownloadTask t)
         {
             if (t == null || t.State != DownloadTaskState.Queued) return false;
@@ -432,7 +434,7 @@ namespace QHotUpdateSystem.Download
                 }
             }
 
-            // HEAD
+            // 保持原逻辑：先 HEAD（后续批次可优化小文件跳过）
             var head = await HttpDownloader.HeadAsync(task.RemoteUrl, _context.Options.TimeoutSeconds);
             if (head.Ok)
             {
@@ -693,10 +695,6 @@ namespace QHotUpdateSystem.Download
             }
         }
 
-        /// <summary>
-        /// 文件最终化（落盘 + 校验） - 见第一批已优化未压缩零复制。
-        /// 本批新增：finally 中释放增量哈希对象。
-        /// </summary>
         private async Task<FinalizeResult> FinalizeFile(DownloadTask task, long attemptDelta, ModuleRuntimeState moduleState)
         {
             try
@@ -797,7 +795,6 @@ namespace QHotUpdateSystem.Download
             }
             finally
             {
-                // 释放增量哈希对象，避免大量下载后占用句柄
                 try
                 {
                     task.IncrementalHash?.Dispose();
@@ -825,7 +822,7 @@ namespace QHotUpdateSystem.Download
 
         #endregion
 
-        #region Followers (未改动核心逻辑)
+        #region Followers
 
         private void PropagateFollowersSuccess(DownloadTask primary)
         {
@@ -893,7 +890,7 @@ namespace QHotUpdateSystem.Download
 
         #endregion
 
-        #region Progress Throttling (未改动)
+        #region Progress Throttling
 
         private void EmitProgressThrottled(DownloadTask task, ModuleRuntimeState moduleState, bool force)
         {
@@ -988,7 +985,7 @@ namespace QHotUpdateSystem.Download
 
         #endregion
 
-        #region Diagnostics (未改动)
+        #region Diagnostics
 
         private void MaybeEmitDiagnosticsSnapshot()
         {
@@ -1061,7 +1058,6 @@ namespace QHotUpdateSystem.Download
 
             bool done;
             bool failed;
-            // 统一锁区间读取，避免边界竞态
             lock (_sync)
             {
                 done = (mState.CompletedFiles + mState.FailedFiles) == mState.TotalFiles;
@@ -1119,7 +1115,7 @@ namespace QHotUpdateSystem.Download
 
         private void CleanupCancelFlags()
         {
-            // 暂不删除 .part，供后续续传参考
+            // 保留 .part，供后续续传
         }
 
         private void TryDelete(string path)

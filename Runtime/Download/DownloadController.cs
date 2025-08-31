@@ -7,7 +7,7 @@ using QHotUpdateSystem.State;
 namespace QHotUpdateSystem.Download
 {
     /// <summary>
-    /// 下载控制器
+    /// 下载控制器（暂停/恢复/取消）
     /// </summary>
     public class DownloadController
     {
@@ -25,6 +25,7 @@ namespace QHotUpdateSystem.Download
         {
             lock (_lock) return _pausedModules.Contains(module);
         }
+
         public bool IsModuleCanceled(string module)
         {
             lock (_lock) return _canceledModules.Contains(module);
@@ -53,6 +54,7 @@ namespace QHotUpdateSystem.Download
                         _pauseSignals.Remove(module);
                 }
             }
+
             tcs?.TrySetResult(true);
         }
 
@@ -67,9 +69,14 @@ namespace QHotUpdateSystem.Download
                         _pauseSignals.Remove(module);
                 }
             }
+
             tcs?.TrySetResult(false);
         }
 
+        /// <summary>
+        /// 取消全部任务
+        /// ★ 修复：旧的 CancellationTokenSource 现在会在安全点异步 Dispose，避免长生命周期泄漏。
+        /// </summary>
         public void CancelAll()
         {
             Dictionary<string, TaskCompletionSource<bool>> signals;
@@ -81,14 +88,37 @@ namespace QHotUpdateSystem.Download
                 signals = new Dictionary<string, TaskCompletionSource<bool>>(_pauseSignals);
                 _pauseSignals.Clear();
 
-                // 仅 Cancel，不立刻 Dispose，避免并发场景下 register 回调 / WaitIfPaused 使用旧 token 时报错
                 oldCts = _globalCts;
-                try { oldCts.Cancel(); } catch { }
-                _globalCts = new CancellationTokenSource();
+                try
+                {
+                    oldCts.Cancel();
+                }
+                catch
+                {
+                }
+
+                _globalCts = new CancellationTokenSource(); // 新 token
             }
+
             foreach (var kv in signals)
                 kv.Value.TrySetResult(false);
-            // 可选：延迟释放 oldCts（这里简单留空 / GC 回收）
+
+            // ★ 异步延迟释放，避免与仍在使用旧 token 的注册产生竞态
+            if (oldCts != null)
+            {
+                System.Threading.Tasks.Task.Run(() =>
+                {
+                    try
+                    {
+                        // 给仍在使用的代码一个极短窗口（这里简单 Sleep 50ms，可选）
+                        System.Threading.Thread.Sleep(50);
+                        oldCts.Dispose();
+                    }
+                    catch
+                    {
+                    }
+                });
+            }
         }
 
         public async Task WaitIfPaused(string module, CancellationToken token)
@@ -105,6 +135,7 @@ namespace QHotUpdateSystem.Download
                         _pauseSignals[module] = tcs;
                     }
                 }
+
                 try
                 {
                     await Task.WhenAny(tcs.Task, Task.Delay(-1, token));
@@ -133,6 +164,7 @@ namespace QHotUpdateSystem.Download
                 if (_pauseSignals.TryGetValue(module, out tcs))
                     _pauseSignals.Remove(module);
             }
+
             tcs?.TrySetResult(true);
         }
     }

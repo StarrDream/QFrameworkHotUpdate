@@ -20,6 +20,7 @@ namespace QHotUpdateSystem.Utility
                 var name = f.name ?? "";
                 sb.Append(name.Length).Append('#').Append(name).Append(f.hash);
             }
+
             return hashFunc(sb.ToString());
         }
     }
