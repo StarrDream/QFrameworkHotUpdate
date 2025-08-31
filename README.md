@@ -1,7 +1,7 @@
 # QHotUpdate System
 
 一个功能完整的Unity热更新系统，支持模块化资源管理、断点续传、多种压缩算法、签名验证等高级特性。
-#注意:在热更新代码中初始化时需要调用: AssetBundleSettings.LoadAssetResFromStreamingAssetsPath = false; 确保设置QFramework为持久化热更路径模式
+# 注意:在热更新代码中初始化时需要调用: AssetBundleSettings.LoadAssetResFromStreamingAssetsPath = false; 确保设置QFramework为持久化热更路径模式
 ## 🚀 特性
 
 - ✅ **模块化设计**：支持按模块管理和更新资源
