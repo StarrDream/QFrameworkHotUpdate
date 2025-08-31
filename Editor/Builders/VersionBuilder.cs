@@ -7,9 +7,18 @@ using QHotUpdateSystem.Editor.Config;
 using QHotUpdateSystem.Editor.Utils;
 using QHotUpdateSystem.Version;
 using QHotUpdateSystem.Core;
+using QHotUpdateSystem.Security; // ★ 引入
 
 namespace QHotUpdateSystem.Editor.Builders
 {
+    /// <summary>
+    /// 版本构建器：
+    /// - 遍历配置模块
+    /// - 展开文件与目录
+    /// - 复制/可选压缩输出到 AssetBundles/<Platform>/
+    /// - 生成 VersionInfo（聚合 hash 由 ModuleAggregator 完成）
+    /// - 构建阶段对输出文件名做 Sanitize，降低运行期风险
+    /// </summary>
     public static class VersionBuilder
     {
         public class BuildResult
@@ -27,7 +36,7 @@ namespace QHotUpdateSystem.Editor.Builders
 
             var modules = new List<ModuleInfo>();
             var validFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            var globalNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase); // 新增：跨模块去重
+            var globalNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
             if (cfg.modules != null)
             {
@@ -46,7 +55,7 @@ namespace QHotUpdateSystem.Editor.Builders
                 timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
                 platform = platform,
                 modules = modules.ToArray(),
-                sign = "" // 构建后由 Exporter 填
+                sign = ""
             };
 
             if (cfg.cleanObsolete)
@@ -109,6 +118,9 @@ namespace QHotUpdateSystem.Editor.Builders
                 ? Path.GetFileName(absFile)
                 : entry.explicitName;
 
+            // ★ 先清洗文件名，减少非法字符 / 路径元素
+            originalName = FileNameValidator.Sanitize(originalName);
+
             string finalName = EnsureUniqueFileName(originalName, globalNames);
 
             string targetFile = Path.Combine(assetPlatformDir, finalName);
@@ -169,6 +181,7 @@ namespace QHotUpdateSystem.Editor.Builders
             do
             {
                 newName = $"{name}_{index}{ext}";
+                newName = FileNameValidator.Sanitize(newName);
                 index++;
             } while (!globalNames.Add(newName));
 

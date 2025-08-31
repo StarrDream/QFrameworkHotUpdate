@@ -12,6 +12,9 @@ using QHotUpdateSystem.State;
 
 namespace QHotUpdateSystem
 {
+    /// <summary>
+    /// 热更新管理器：初始化、核心模块更新、普通模块更新调度
+    /// </summary>
     public class HotUpdateManager
     {
         private static HotUpdateManager _instance;
@@ -23,7 +26,6 @@ namespace QHotUpdateSystem
         private bool _initialized;
         private bool _coreReady;
 
-        // 可注入签名校验
         private IVersionSignatureVerifier _signatureVerifier;
         private bool _enableSignatureVerify;
 
@@ -63,19 +65,15 @@ namespace QHotUpdateSystem
             _context.RemoteVersion = await VersionLoader.LoadRemote(remoteUrl, _context.JsonSerializer);
             if (_context.RemoteVersion != null && _enableSignatureVerify && _signatureVerifier != null)
             {
-                // 重新读取原始 JSON 进行校验（简单：重新请求或持有文本；这里简化：将远端结构序列化后校验）
-                var jsonSerializer = _context.JsonSerializer;
                 var rawSign = _context.RemoteVersion.sign;
                 var cacheSign = _context.RemoteVersion.sign;
                 _context.RemoteVersion.sign = "";
-                var serialized = jsonSerializer.Serialize(_context.RemoteVersion, false);
+                var serialized = _context.JsonSerializer.Serialize(_context.RemoteVersion, false);
                 _context.RemoteVersion.sign = cacheSign;
 
                 if (!_signatureVerifier.Verify(serialized, rawSign))
                 {
                     HotUpdateLogger.Error("Version signature verify failed!");
-                    // 可选择置空 RemoteVersion 防止更新
-                    // _context.RemoteVersion = null;
                 }
                 else
                 {
@@ -109,8 +107,22 @@ namespace QHotUpdateSystem
                 onComplete?.Invoke();
                 return;
             }
+
+            var tcs = new TaskCompletionSource<bool>();
+            void Handler(string module, ModuleStatus status)
+            {
+                if (module == "Core" && (status == ModuleStatus.Updated || status == ModuleStatus.Failed))
+                {
+                    HotUpdateEvents.OnModuleStatusChanged -= Handler;
+                    tcs.TrySetResult(status == ModuleStatus.Updated);
+                }
+            }
+
+            HotUpdateEvents.OnModuleStatusChanged += Handler;
             await _downloadManager.DownloadModuleAsync("Core", DownloadPriority.Critical);
-            _coreReady = true; // 这里在真实项目中应等待模块状态成功后再置 true
+
+            bool success = await tcs.Task;
+            _coreReady = success;
             HotUpdateEvents.InvokeCoreReady();
             onComplete?.Invoke();
         }
@@ -128,7 +140,6 @@ namespace QHotUpdateSystem
             }
         }
 
-        // 控制接口
         public void PauseModule(string module) => _downloadManager?.PauseModule(module);
         public void ResumeModule(string module) => _downloadManager?.ResumeModule(module);
         public void CancelModule(string module) => _downloadManager?.CancelModule(module);
