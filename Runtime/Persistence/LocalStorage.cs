@@ -2,11 +2,15 @@
 using System.IO;
 using System.Text;
 using QHotUpdateSystem.Platform;
+using QHotUpdateSystem.Security;
 
 namespace QHotUpdateSystem.Persistence
 {
     /// <summary>
-    /// 本地存储路径管理
+    /// 本地路径管理
+    /// 说明：
+    /// - 若升级过程中已有旧 .part，不再自动迁移；旧任务将从 0 重新下载（一次性影响可接受）。
+    /// - 如需兼容可在未来加入“扫描旧命名”逻辑尝试匹配。
     /// </summary>
     public class LocalStorage
     {
@@ -24,6 +28,8 @@ namespace QHotUpdateSystem.Persistence
         public string TempDir => adapter.GetTempDir();
 
         public string GetAssetPath(string fileName) => Path.Combine(AssetDir, fileName);
+
+        [Obsolete("未使用的旧接口保留以防外部代码引用")]
         public string GetTempFile(string fileName) => Path.Combine(TempDir, fileName + ".part");
 
         public string GetTempFile(string moduleName, string fileName, string hash)
@@ -32,43 +38,29 @@ namespace QHotUpdateSystem.Persistence
             if (string.IsNullOrEmpty(fileName)) fileName = "F";
             if (string.IsNullOrEmpty(hash)) hash = "na";
 
-            moduleName = SanitizeForFile(moduleName);
-            fileName = SanitizeForFile(fileName);
-            hash = SanitizeForFile(hash);
+            // 计算模块与文件名的 MD5 前缀（避免直接使用原始长文件名）
+            string modPrefix = HashUtility.Compute(moduleName, "md5");
+            string filePrefix = HashUtility.Compute(fileName, "md5");
 
-            if (hash.Length > 16) hash = hash.Substring(0, 16);
+            modPrefix = SafeHead(modPrefix, 8);
+            filePrefix = SafeHead(filePrefix, 8);
 
-            string name = Path.GetFileNameWithoutExtension(fileName);
-            string combinedBase = $"{name}";
-            if (combinedBase.Length > 60)
-                combinedBase = combinedBase.Substring(0, 60);
+            // 取文件自身 hash（理论上由外部版本文件给出：md5/sha1 等）
+            string mainHashPart = hash.Length > 32 ? hash.Substring(0, 32) : hash;
 
-            string tempPureName = $"{moduleName}__{combinedBase}__{hash}.part";
-            if (tempPureName.Length > 120)
-                tempPureName = tempPureName.Substring(0, 120);
+            string tempPureName = $"{modPrefix}_{filePrefix}_{mainHashPart}.part";
+            // 控制最大长度（极端情况下）
+            if (tempPureName.Length > 96)
+                tempPureName = tempPureName.Substring(0, 96);
 
             return Path.Combine(TempDir, tempPureName);
         }
 
-        private string SanitizeForFile(string s)
+        private string SafeHead(string s, int len)
         {
-            if (string.IsNullOrEmpty(s)) return "_";
-            var invalid = Path.GetInvalidFileNameChars();
-            var sb = new StringBuilder(s.Length);
-            foreach (var c in s)
-            {
-                bool bad = false;
-                for (int i = 0; i < invalid.Length; i++)
-                {
-                    if (c == invalid[i])
-                    {
-                        bad = true;
-                        break;
-                    }
-                }
-                sb.Append(bad ? '_' : c);
-            }
-            return sb.ToString();
+            if (string.IsNullOrEmpty(s)) return "x";
+            if (s.Length <= len) return s;
+            return s.Substring(0, len);
         }
 
         public void EnsureBaseDirs()
@@ -92,8 +84,7 @@ namespace QHotUpdateSystem.Persistence
         }
 
         /// <summary>
-        /// 清理过期临时文件（.part 及其 .meta）。基于 meta 中 timestamp；若无 meta 则按文件最后写入时间。
-        /// maxAgeHours: 过期小时数，例如 24
+        /// 清理过期临时文件
         /// </summary>
         public int CleanExpiredTemps(double maxAgeHours)
         {
@@ -114,11 +105,9 @@ namespace QHotUpdateSystem.Persistence
                     }
                     if (ts == 0)
                     {
-                        ts = (long)(DateTime.UtcNow - File.GetLastWriteTimeUtc(part)).TotalSeconds;
-                        // 若没有 meta，用“文件距现在的秒差”粗略估计，再与阈值比较
-                        if (ts < 0) ts = 0;
-                        // 转换方式不同：这里让 ts 表示文件过去时间秒；统一下面比较逻辑
-                        if (ts > maxAgeHours * 3600)
+                        // 使用文件的“过去时间秒数”估算
+                        var diff = (long)(DateTime.UtcNow - File.GetLastWriteTimeUtc(part)).TotalSeconds;
+                        if (diff > maxAgeHours * 3600)
                         {
                             File.Delete(part);
                             if (File.Exists(metaPath)) File.Delete(metaPath);
@@ -126,7 +115,6 @@ namespace QHotUpdateSystem.Persistence
                         }
                         continue;
                     }
-                    // ts 为写入时刻的 unix 秒
                     if (now - ts > maxAgeHours * 3600)
                     {
                         File.Delete(part);
@@ -134,7 +122,7 @@ namespace QHotUpdateSystem.Persistence
                         removed++;
                     }
                 }
-                catch { /* 忽略单个删除失败 */ }
+                catch { /* 忽略单条错误 */ }
             }
             return removed;
         }

@@ -2,7 +2,6 @@
 using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
-using QHotUpdateSystem.Core;
 using QHotUpdateSystem.State;
 
 namespace QHotUpdateSystem.Download
@@ -54,7 +53,7 @@ namespace QHotUpdateSystem.Download
                         _pauseSignals.Remove(module);
                 }
             }
-            tcs?.TrySetResult(true); // 唤醒等待
+            tcs?.TrySetResult(true);
         }
 
         public void CancelModule(string module)
@@ -68,29 +67,30 @@ namespace QHotUpdateSystem.Download
                         _pauseSignals.Remove(module);
                 }
             }
-            tcs?.TrySetResult(false); // 取消也唤醒等待
+            tcs?.TrySetResult(false);
         }
 
         public void CancelAll()
         {
             Dictionary<string, TaskCompletionSource<bool>> signals;
+            CancellationTokenSource oldCts;
             lock (_lock)
             {
                 _canceledModules.Clear();
                 _pausedModules.Clear();
                 signals = new Dictionary<string, TaskCompletionSource<bool>>(_pauseSignals);
                 _pauseSignals.Clear();
-                _globalCts.Cancel();
-                _globalCts.Dispose();
+
+                // 仅 Cancel，不立刻 Dispose，避免并发场景下 register 回调 / WaitIfPaused 使用旧 token 时报错
+                oldCts = _globalCts;
+                try { oldCts.Cancel(); } catch { }
                 _globalCts = new CancellationTokenSource();
             }
             foreach (var kv in signals)
                 kv.Value.TrySetResult(false);
+            // 可选：延迟释放 oldCts（这里简单留空 / GC 回收）
         }
 
-        /// <summary>
-        /// 暂停等待：若模块被暂停，则阻塞直到恢复或取消。
-        /// </summary>
         public async Task WaitIfPaused(string module, CancellationToken token)
         {
             while (true)

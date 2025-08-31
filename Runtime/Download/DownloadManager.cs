@@ -20,6 +20,9 @@ namespace QHotUpdateSystem.Download
 {
     /// <summary>
     /// 下载管理器
+    /// 1. Lazy Aging：全量重建 => 在实际出队启动时惰性调整优先级。
+    /// 2. CheckModuleComplete 在统一锁内读取统计，避免潜在竞态。
+    /// 3. FinalizeFile 结束后释放增量哈希对象，防止泄露。
     /// </summary>
     public class DownloadManager
     {
@@ -51,20 +54,19 @@ namespace QHotUpdateSystem.Download
         private double _lastFileEmitSec;
         private const double ProgressEmitIntervalSec = 0.06;
 
-        // Aging & 诊断
+        // Aging & 诊断计时
         private readonly Stopwatch _agingWatch = Stopwatch.StartNew();
-        private double _lastAgingRebuildSec;
         private double _lastDiagnosticsEmitSec;
         private const double DiagnosticsIntervalSec = 3.0;
 
-        // Aging 策略
-        private const double AgingCheckIntervalSec = 5.0;
-        private const double AgingWaitThresholdSec = 15.0;
-        private const double AgingStepSec = 10.0;
+        // Lazy Aging 参数（替代原全量重建）
+        private const double AgingWaitThresholdSec = 15.0; // 等待超过该阈值才开始提升
+        private const double AgingStepSec = 10.0; // 每额外 AgingStepSec 提升一次
+        private const int AgingPriorityStep = 5; // 每次提升的优先级增量
 
-        // 事件驱动调度信号 (批次3)
+        // 事件驱动调度信号
         private readonly SemaphoreSlim _loopSignal = new SemaphoreSlim(0, int.MaxValue);
-        private const int LoopWaitTimeoutMs = 500; // 超时后用于周期性 aging/diagnostics 检查
+        private const int LoopWaitTimeoutMs = 500;
 
         public IVersionSignatureVerifier VersionVerifier;
         public bool IsBusy => _loopActive;
@@ -88,6 +90,7 @@ namespace QHotUpdateSystem.Download
                 HotUpdateEvents.InvokeModuleStatus(moduleName, ModuleStatus.Failed);
                 return;
             }
+
             var localModule = FindModule(_context.LocalVersion, moduleName);
             var changed = VersionComparer.GetChangedFiles(remoteModule, localModule);
 
@@ -105,7 +108,10 @@ namespace QHotUpdateSystem.Download
             state.TotalFiles = safeFiles.Count;
             state.TotalBytes = safeFiles.Sum(f => f.compressed ? f.cSize : f.size);
 
-            lock (_sync) { _globalTotalBytes += state.TotalBytes; }
+            lock (_sync)
+            {
+                _globalTotalBytes += state.TotalBytes;
+            }
 
             HotUpdateEvents.InvokeModuleStatus(moduleName, ModuleStatus.Updating);
 
@@ -129,7 +135,10 @@ namespace QHotUpdateSystem.Download
                             TryDelete(temp);
                         }
                     }
-                    catch { existing = 0; }
+                    catch
+                    {
+                        existing = 0;
+                    }
                 }
 
                 var metaPath = _storage.GetResumeMetaPath(moduleName, f.name, f.hash);
@@ -192,7 +201,7 @@ namespace QHotUpdateSystem.Download
             _controller.PauseModule(module);
             ExtendedDownloadEvents.InvokeModulePaused(module);
             _controller.StateMachine.TryTransition(DownloadState.Paused);
-            SignalLoop(); // 唤醒检查是否全部暂停可提前 Idle
+            SignalLoop();
         }
 
         public void ResumeModule(string module)
@@ -246,6 +255,7 @@ namespace QHotUpdateSystem.Download
                         list = new List<DownloadTask>();
                         _mergedFollowers[existingPrimary] = list;
                     }
+
                     task.IsAlias = true;
                     list.Add(task);
                     task.State = DownloadTaskState.Queued;
@@ -258,12 +268,19 @@ namespace QHotUpdateSystem.Download
                     _queuedTasks.Add(task);
                 }
             }
+
             SignalLoop();
         }
 
         private void SignalLoop()
         {
-            try { _loopSignal.Release(); } catch { }
+            try
+            {
+                _loopSignal.Release();
+            }
+            catch
+            {
+            }
         }
 
         private async Task ProcessLoop()
@@ -285,8 +302,7 @@ namespace QHotUpdateSystem.Download
                         break;
                     }
 
-                    // 2) Aging/Diagnostics 定期触发
-                    MaybeRebuildQueueForAging();
+                    // 2) 诊断周期事件
                     MaybeEmitDiagnosticsSnapshot();
 
                     // 3) 尝试启动新的任务
@@ -303,7 +319,14 @@ namespace QHotUpdateSystem.Download
                                 var next = _queue.Dequeue();
                                 _queuedTasks.Remove(next);
 
-                                if (_controller.IsModuleCanceled(next.Module))
+                                // Lazy Aging：如果等待时间超阈值 => 动态调整优先级后再入队重试
+                                if (ApplyAgingPriority(next))
+                                {
+                                    // 重新入队后跳过本轮启动
+                                    _queue.Enqueue((int)next.Priority, next);
+                                    _queuedTasks.Add(next);
+                                }
+                                else if (_controller.IsModuleCanceled(next.Module))
                                 {
                                     next.State = DownloadTaskState.Canceled;
                                     MarkPrimaryAndFollowersFailedOrCanceled(next, true);
@@ -311,6 +334,7 @@ namespace QHotUpdateSystem.Download
                                 }
                                 else if (_controller.IsModulePaused(next.Module))
                                 {
+                                    // 模块暂停，放回队列
                                     _queue.Enqueue((int)next.Priority, next);
                                     _queuedTasks.Add(next);
                                 }
@@ -327,7 +351,7 @@ namespace QHotUpdateSystem.Download
                         _ = RunTaskAsync(toStart);
 
                     if (idle)
-                        break; // 队列和运行都空 -> 完成
+                        break;
 
                     // 4) 等待唤醒或超时
                     await _loopSignal.WaitAsync(LoopWaitTimeoutMs);
@@ -336,7 +360,11 @@ namespace QHotUpdateSystem.Download
             finally
             {
                 bool finished;
-                lock (_sync) { finished = _queue.Count == 0 && _running.Count == 0; }
+                lock (_sync)
+                {
+                    finished = _queue.Count == 0 && _running.Count == 0;
+                }
+
                 if (finished)
                 {
                     _controller.StateMachine.TryTransition(DownloadState.Completed);
@@ -344,8 +372,36 @@ namespace QHotUpdateSystem.Download
                     EmitFinalDiagnosticsSnapshot();
                     HotUpdateEvents.InvokeAllTasksCompleted();
                 }
+
                 _loopActive = false;
             }
+        }
+
+        /// <summary>
+        /// 惰性 Aging：若任务等待超阈值，则根据 (等待时间 - 阈值)/步长 计算应提升的优先级。
+        /// 返回 true 表示已调整优先级（需要重新入队）。
+        /// </summary>
+        private bool ApplyAgingPriority(DownloadTask t)
+        {
+            if (t == null || t.State != DownloadTaskState.Queued) return false;
+            var now = _agingWatch.Elapsed.TotalSeconds;
+            var wait = now - t.EnqueueTimeSec;
+            if (wait < AgingWaitThresholdSec) return false;
+
+            int steps = (int)((wait - AgingWaitThresholdSec) / AgingStepSec) + 1;
+            int old = (int)t.Priority;
+            int target = old + steps * AgingPriorityStep;
+            if (target > (int)DownloadPriority.Critical)
+                target = (int)DownloadPriority.Critical;
+            if (target != old)
+            {
+                t.Priority = (DownloadPriority)target;
+                StructuredLogger.Log(StructuredLogger.Level.Info, "LazyAgingUpgrade",
+                    new { file = t.File?.name, old, @new = target, wait });
+                return true;
+            }
+
+            return false;
         }
 
         private bool AreAllQueuedModulesPausedLocked()
@@ -376,7 +432,7 @@ namespace QHotUpdateSystem.Download
                 }
             }
 
-            // HEAD (含 ETag/Last-Modified) - 批次2逻辑保留
+            // HEAD
             var head = await HttpDownloader.HeadAsync(task.RemoteUrl, _context.Options.TimeoutSeconds);
             if (head.Ok)
             {
@@ -390,6 +446,7 @@ namespace QHotUpdateSystem.Download
                         task.ExistingBytes = 0;
                     }
                 }
+
                 task.ETag = head.ETag;
                 task.LastModified = head.LastModified;
 
@@ -409,6 +466,7 @@ namespace QHotUpdateSystem.Download
                             if (moduleStateX.DownloadedBytes < 0) moduleStateX.DownloadedBytes = 0;
                             if (_globalDownloadedBytes < 0) _globalDownloadedBytes = 0;
                         }
+
                         task.ExistingBytes = 0;
                         TryDelete(task.TempPath);
                         TryDelete(task.ResumeMetaPath);
@@ -460,6 +518,7 @@ namespace QHotUpdateSystem.Download
                                 moduleState.DownloadedBytes += delta;
                                 _globalDownloadedBytes += delta;
                             }
+
                             _globalSpeed.AddSample(delta);
                             EmitProgressThrottled(task, moduleState, force: false);
                             return true;
@@ -518,10 +577,15 @@ namespace QHotUpdateSystem.Download
                         await RetryPolicy.DelayForRetry(task.RetryCount);
                         continue;
                     }
+
                     if (!task.IsAlias)
                     {
-                        lock (_sync) { moduleState.FailedFiles++; }
+                        lock (_sync)
+                        {
+                            moduleState.FailedFiles++;
+                        }
                     }
+
                     moduleState.LastError = task.LastError;
                     EmitProgressThrottled(task, moduleState, force: true);
                     HotUpdateEvents.InvokeError(task.Module, $"File {task.File.name} failed (network): {task.LastError}");
@@ -537,8 +601,12 @@ namespace QHotUpdateSystem.Download
                     task.ErrorCode = DownloadErrorCode.None;
                     if (!task.IsAlias)
                     {
-                        lock (_sync) { moduleState.CompletedFiles++; }
+                        lock (_sync)
+                        {
+                            moduleState.CompletedFiles++;
+                        }
                     }
+
                     EmitProgressThrottled(task, moduleState, force: true);
                     PropagateFollowersSuccess(task);
                     finished = true;
@@ -564,6 +632,7 @@ namespace QHotUpdateSystem.Download
                             if (moduleState.DownloadedBytes < 0) moduleState.DownloadedBytes = 0;
                         }
                     }
+
                     if (fin.ErrorCode == DownloadErrorCode.IntegrityMismatch && fin.TempInvalidated && task.ExistingBytes > 0)
                     {
                         long rollback = task.ExistingBytes;
@@ -574,6 +643,7 @@ namespace QHotUpdateSystem.Download
                             if (moduleState.DownloadedBytes < 0) moduleState.DownloadedBytes = 0;
                             if (_globalDownloadedBytes < 0) _globalDownloadedBytes = 0;
                         }
+
                         task.ExistingBytes = 0;
                     }
 
@@ -591,8 +661,12 @@ namespace QHotUpdateSystem.Download
 
                     if (!task.IsAlias)
                     {
-                        lock (_sync) { moduleState.FailedFiles++; }
+                        lock (_sync)
+                        {
+                            moduleState.FailedFiles++;
+                        }
                     }
+
                     moduleState.LastError = task.LastError;
                     EmitProgressThrottled(task, moduleState, force: true);
                     HotUpdateEvents.InvokeError(task.Module, $"File {task.File.name} failed ({task.ErrorCode}): {task.LastError}");
@@ -619,20 +693,22 @@ namespace QHotUpdateSystem.Download
             }
         }
 
+        /// <summary>
+        /// 文件最终化（落盘 + 校验） - 见第一批已优化未压缩零复制。
+        /// 本批新增：finally 中释放增量哈希对象。
+        /// </summary>
         private async Task<FinalizeResult> FinalizeFile(DownloadTask task, long attemptDelta, ModuleRuntimeState moduleState)
         {
             try
             {
                 if (!FileNameValidator.IsSafeRelativeName(task.File.name))
                     return FinalizeResult.Fail(DownloadErrorCode.UnsafePath, "Unsafe file name", true);
-
                 if (!FileNameValidator.IsPathWithinRoot(_storage.AssetDirFullPath, task.FinalPath))
                     return FinalizeResult.Fail(DownloadErrorCode.UnsafePath, "Target path outside asset root", true);
 
                 var tempInfo = new FileInfo(task.TempPath);
                 if (!tempInfo.Exists)
                     return FinalizeResult.Fail(DownloadErrorCode.IO, "Temp missing", true);
-
                 if (tempInfo.Length != task.TotalBytes)
                     return FinalizeResult.Fail(DownloadErrorCode.IO, $"Length mismatch expect={task.TotalBytes} got={tempInfo.Length}", true);
 
@@ -649,16 +725,44 @@ namespace QHotUpdateSystem.Download
                             return FinalizeResult.Ok();
                         }
                     }
+
                     SafeDelete(task.FinalPath);
                 }
 
-                string finalTemp = task.FinalPath + ".dl_tmp";
-                if (File.Exists(finalTemp)) SafeDelete(finalTemp);
-
                 string computedHash = null;
 
-                if (task.IsCompressed)
+                if (!task.IsCompressed)
                 {
+                    if (task.IncrementalHash != null && task.ExistingBytes == 0)
+                    {
+                        computedHash = task.IncrementalHash.FinalHex();
+                    }
+                    else
+                    {
+                        using (var fs = File.OpenRead(task.TempPath))
+                            computedHash = HashUtility.ComputeStream(fs, _context.Options.HashAlgo);
+                    }
+
+                    if (!string.Equals(computedHash, task.File.hash, StringComparison.OrdinalIgnoreCase))
+                    {
+                        SafeDelete(task.TempPath);
+                        TryDelete(task.ResumeMetaPath);
+                        return FinalizeResult.Fail(DownloadErrorCode.IntegrityMismatch,
+                            $"Hash mismatch expect={task.File.hash} got={computedHash}", true);
+                    }
+
+                    if (File.Exists(task.FinalPath))
+                        SafeDelete(task.FinalPath);
+                    File.Move(task.TempPath, task.FinalPath);
+                    TryDelete(task.ResumeMetaPath);
+                    task.OnCompleted?.Invoke(task);
+                    return FinalizeResult.Ok();
+                }
+                else
+                {
+                    string finalTemp = task.FinalPath + ".dl_tmp";
+                    if (File.Exists(finalTemp)) SafeDelete(finalTemp);
+
                     var comp = CompressorRegistry.Get(task.File.algo);
                     if (comp == null)
                         return FinalizeResult.Fail(DownloadErrorCode.DecompressFail, "No compressor: " + task.File.algo, true);
@@ -668,41 +772,24 @@ namespace QHotUpdateSystem.Download
 
                     using (var fs = File.OpenRead(finalTemp))
                         computedHash = HashUtility.ComputeStream(fs, _context.Options.HashAlgo);
-                }
-                else
-                {
-                    if (task.IncrementalHash != null && task.ExistingBytes == 0)
-                    {
-                        task.IncrementalHashHex = task.IncrementalHash.FinalHex();
-                        computedHash = task.IncrementalHashHex;
-                        File.Copy(task.TempPath, finalTemp, true);
-                    }
-                    else
-                    {
-                        File.Copy(task.TempPath, finalTemp, true);
-                        using (var fs = File.OpenRead(finalTemp))
-                            computedHash = HashUtility.ComputeStream(fs, _context.Options.HashAlgo);
-                    }
-                }
 
-                if (!string.Equals(computedHash, task.File.hash, StringComparison.OrdinalIgnoreCase))
-                {
-                    SafeDelete(finalTemp);
+                    if (!string.Equals(computedHash, task.File.hash, StringComparison.OrdinalIgnoreCase))
+                    {
+                        SafeDelete(finalTemp);
+                        SafeDelete(task.TempPath);
+                        TryDelete(task.ResumeMetaPath);
+                        return FinalizeResult.Fail(DownloadErrorCode.IntegrityMismatch,
+                            $"Hash mismatch expect={task.File.hash} got={computedHash}", true);
+                    }
+
+                    if (File.Exists(task.FinalPath))
+                        SafeDelete(task.FinalPath);
+                    File.Move(finalTemp, task.FinalPath);
                     SafeDelete(task.TempPath);
                     TryDelete(task.ResumeMetaPath);
-                    return FinalizeResult.Fail(DownloadErrorCode.IntegrityMismatch,
-                        $"Hash mismatch expect={task.File.hash} got={computedHash}", true);
+                    task.OnCompleted?.Invoke(task);
+                    return FinalizeResult.Ok();
                 }
-
-                if (File.Exists(task.FinalPath))
-                    SafeDelete(task.FinalPath);
-                File.Move(finalTemp, task.FinalPath);
-
-                SafeDelete(task.TempPath);
-                TryDelete(task.ResumeMetaPath);
-
-                task.OnCompleted?.Invoke(task);
-                return FinalizeResult.Ok();
             }
             catch (Exception e)
             {
@@ -710,19 +797,35 @@ namespace QHotUpdateSystem.Download
             }
             finally
             {
+                // 释放增量哈希对象，避免大量下载后占用句柄
+                try
+                {
+                    task.IncrementalHash?.Dispose();
+                }
+                catch
+                {
+                }
+
+                task.IncrementalHash = null;
                 await Task.Yield();
             }
         }
 
         private void SafeDelete(string path)
         {
-            try { if (File.Exists(path)) File.Delete(path); }
-            catch (Exception e) { HotUpdateLogger.Warn("SafeDelete failed: " + path + " err=" + e.Message); }
+            try
+            {
+                if (File.Exists(path)) File.Delete(path);
+            }
+            catch (Exception e)
+            {
+                HotUpdateLogger.Warn("SafeDelete failed: " + path + " err=" + e.Message);
+            }
         }
 
         #endregion
 
-        #region Followers
+        #region Followers (未改动核心逻辑)
 
         private void PropagateFollowersSuccess(DownloadTask primary)
         {
@@ -732,6 +835,7 @@ namespace QHotUpdateSystem.Download
                 if (!_mergedFollowers.TryGetValue(primary, out followers))
                     return;
             }
+
             foreach (var follower in followers)
             {
                 follower.State = DownloadTaskState.Completed;
@@ -740,7 +844,11 @@ namespace QHotUpdateSystem.Download
                 follower.LastError = null;
                 follower.ErrorCode = DownloadErrorCode.None;
             }
-            lock (_sync) { _mergedFollowers.Remove(primary); }
+
+            lock (_sync)
+            {
+                _mergedFollowers.Remove(primary);
+            }
         }
 
         private void PropagateFollowersFailure(DownloadTask primary)
@@ -751,13 +859,18 @@ namespace QHotUpdateSystem.Download
                 if (!_mergedFollowers.TryGetValue(primary, out followers))
                     return;
             }
+
             foreach (var follower in followers)
             {
                 follower.State = DownloadTaskState.Failed;
                 follower.LastError = primary.LastError;
                 follower.ErrorCode = primary.ErrorCode;
             }
-            lock (_sync) { _mergedFollowers.Remove(primary); }
+
+            lock (_sync)
+            {
+                _mergedFollowers.Remove(primary);
+            }
         }
 
         private void MarkPrimaryAndFollowersFailedOrCanceled(DownloadTask primary, bool canceled)
@@ -772,6 +885,7 @@ namespace QHotUpdateSystem.Download
                         follower.State = canceled ? DownloadTaskState.Canceled : DownloadTaskState.Failed;
                         follower.ErrorCode = canceled ? DownloadErrorCode.Canceled : DownloadErrorCode.Unknown;
                     }
+
                     _mergedFollowers.Remove(primary);
                 }
             }
@@ -779,7 +893,7 @@ namespace QHotUpdateSystem.Download
 
         #endregion
 
-        #region Progress Throttling
+        #region Progress Throttling (未改动)
 
         private void EmitProgressThrottled(DownloadTask task, ModuleRuntimeState moduleState, bool force)
         {
@@ -816,6 +930,7 @@ namespace QHotUpdateSystem.Download
                         Speed = _globalSpeed.GetSpeed()
                     };
                 }
+
                 if (emitModule)
                 {
                     _lastModuleEmitSec[task.Module] = nowSec;
@@ -833,6 +948,7 @@ namespace QHotUpdateSystem.Download
                         Speed = _globalSpeed.GetSpeed()
                     };
                 }
+
                 if (emitGlobal)
                 {
                     _lastGlobalEmitSec = nowSec;
@@ -855,7 +971,12 @@ namespace QHotUpdateSystem.Download
         private void ForceEmitGlobalProgress()
         {
             long gDown, gTot;
-            lock (_sync) { gDown = _globalDownloadedBytes; gTot = _globalTotalBytes; }
+            lock (_sync)
+            {
+                gDown = _globalDownloadedBytes;
+                gTot = _globalTotalBytes;
+            }
+
             var gInfo = new GlobalProgressInfo
             {
                 DownloadedBytes = gDown,
@@ -867,7 +988,7 @@ namespace QHotUpdateSystem.Download
 
         #endregion
 
-        #region Diagnostics
+        #region Diagnostics (未改动)
 
         private void MaybeEmitDiagnosticsSnapshot()
         {
@@ -877,10 +998,7 @@ namespace QHotUpdateSystem.Download
             EmitDiagnosticsSnapshot();
         }
 
-        private void EmitFinalDiagnosticsSnapshot()
-        {
-            EmitDiagnosticsSnapshot();
-        }
+        private void EmitFinalDiagnosticsSnapshot() => EmitDiagnosticsSnapshot();
 
         private void EmitDiagnosticsSnapshot()
         {
@@ -929,61 +1047,8 @@ namespace QHotUpdateSystem.Download
                         }).ToArray()
                 };
             }
+
             HotUpdateEvents.InvokeDiagnostics(snap);
-        }
-
-        #endregion
-
-        #region Aging
-
-        private void MaybeRebuildQueueForAging()
-        {
-            var now = _agingWatch.Elapsed.TotalSeconds;
-            if (now - _lastAgingRebuildSec < AgingCheckIntervalSec) return;
-            _lastAgingRebuildSec = now;
-
-            List<DownloadTask> temp = null;
-            bool anyChanged = false;
-            lock (_sync)
-            {
-                if (_queue.Count == 0) return;
-
-                temp = new List<DownloadTask>(_queue.Count);
-                while (_queue.Count > 0)
-                {
-                    var t = _queue.Dequeue();
-                    temp.Add(t);
-                }
-
-                foreach (var t in temp)
-                {
-                    if (t.State != DownloadTaskState.Queued) continue;
-                    var wait = now - t.EnqueueTimeSec;
-                    if (wait < AgingWaitThresholdSec) continue;
-
-                    int steps = (int)((wait - AgingWaitThresholdSec) / AgingStepSec) + 1;
-                    var old = (int)t.Priority;
-                    int target = old + steps * 5;
-                    if (target > (int)DownloadPriority.Critical)
-                        target = (int)DownloadPriority.Critical;
-                    if (target != old)
-                    {
-                        t.Priority = (DownloadPriority)target;
-                        anyChanged = true;
-                    }
-                }
-
-                foreach (var t in temp)
-                {
-                    _queue.Enqueue((int)t.Priority, t);
-                }
-            }
-
-            if (anyChanged)
-            {
-                StructuredLogger.Log(StructuredLogger.Level.Info, "AgingRebuild",
-                    new { queueCount = temp.Count, time = now });
-            }
         }
 
         #endregion
@@ -993,13 +1058,16 @@ namespace QHotUpdateSystem.Download
         private void CheckModuleComplete(string module)
         {
             if (!_context.ModuleStates.TryGetValue(module, out var mState)) return;
+
             bool done;
             bool failed;
+            // 统一锁区间读取，避免边界竞态
             lock (_sync)
             {
                 done = (mState.CompletedFiles + mState.FailedFiles) == mState.TotalFiles;
                 failed = mState.FailedFiles > 0;
             }
+
             if (!done) return;
 
             if (!failed)
@@ -1010,6 +1078,7 @@ namespace QHotUpdateSystem.Download
                     VersionWriter.UpsertModule(_context.LocalVersion, remoteModule);
                     VersionLoader.SaveLocal(_context.PlatformAdapter.GetLocalVersionFilePath(), _context.LocalVersion, _context.JsonSerializer);
                 }
+
                 mState.Status = ModuleStatus.Updated;
                 HotUpdateEvents.InvokeModuleStatus(module, ModuleStatus.Updated);
             }
@@ -1018,6 +1087,7 @@ namespace QHotUpdateSystem.Download
                 mState.Status = ModuleStatus.Failed;
                 HotUpdateEvents.InvokeModuleStatus(module, ModuleStatus.Failed);
             }
+
             _controller.ClearModuleFlags(module);
         }
 
@@ -1028,6 +1098,7 @@ namespace QHotUpdateSystem.Download
                 VersionWriter.UpsertModule(_context.LocalVersion, remoteModule);
                 VersionLoader.SaveLocal(_context.PlatformAdapter.GetLocalVersionFilePath(), _context.LocalVersion, _context.JsonSerializer);
             }
+
             var state = _context.ModuleStates[remoteModule.name];
             state.Status = ModuleStatus.Installed;
             HotUpdateEvents.InvokeModuleStatus(remoteModule.name, ModuleStatus.Installed);
@@ -1041,18 +1112,25 @@ namespace QHotUpdateSystem.Download
         {
             if (v?.modules == null) return null;
             foreach (var m in v.modules)
-                if (m.name == name) return m;
+                if (m.name == name)
+                    return m;
             return null;
         }
 
         private void CleanupCancelFlags()
         {
-            // 暂不删除 .part，让后续可参考续传；过期清理由 LocalStorage 调用统一处理
+            // 暂不删除 .part，供后续续传参考
         }
 
         private void TryDelete(string path)
         {
-            try { if (File.Exists(path)) File.Delete(path); } catch { }
+            try
+            {
+                if (File.Exists(path)) File.Delete(path);
+            }
+            catch
+            {
+            }
         }
 
         #endregion

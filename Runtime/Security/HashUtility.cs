@@ -1,41 +1,42 @@
 ﻿using System;
+using System.IO;
 using System.Security.Cryptography;
 using System.Text;
-using System.IO;
 
 namespace QHotUpdateSystem.Security
 {
     /// <summary>
-    /// Hash 计算工具
+    /// 哈希计算工具（统一精简版）
     /// </summary>
     public static class HashUtility
     {
+        /// <summary>对字符串（UTF8）计算哈希</summary>
         public static string Compute(string text, string algo)
         {
             if (string.IsNullOrEmpty(text)) return string.Empty;
-            byte[] data = Encoding.UTF8.GetBytes(text);
-            return Compute(data, algo);
+            return Compute(Encoding.UTF8.GetBytes(text), algo);
         }
 
+        /// <summary>对字节数组计算哈希</summary>
         public static string Compute(byte[] data, string algo)
         {
             if (data == null) return string.Empty;
-            if (algo == null) algo = "md5";
-            using (HashAlgorithm h = SelectAlgo(algo))
+            using (var h = SelectAlgo(algo))
             {
-                var hash = h.ComputeHash(data);
-                return ToHex(hash);
+                return ToHex(h.ComputeHash(data));
             }
         }
 
         /// <summary>
-        /// 流式哈希：用于大文件，避免一次性读取全部内容
+        /// 对流进行分块计算哈希（不会关闭传入流）。
+        /// 默认 64KB buffer；可根据大文件需求调节。
         /// </summary>
-        public static string ComputeStream(Stream stream, string algo, int bufferSize = 1024 * 64)
+        public static string ComputeStream(Stream stream, string algo, int bufferSize = 64 * 1024)
         {
-            if (stream == null) return string.Empty;
-            if (algo == null) algo = "md5";
-            using (HashAlgorithm h = SelectAlgo(algo))
+            if (stream == null) throw new ArgumentNullException(nameof(stream));
+            if (bufferSize <= 0) bufferSize = 64 * 1024;
+
+            using (var h = SelectAlgo(algo))
             {
                 var buffer = new byte[bufferSize];
                 int read;
@@ -43,67 +44,27 @@ namespace QHotUpdateSystem.Security
                 {
                     h.TransformBlock(buffer, 0, read, null, 0);
                 }
-
                 h.TransformFinalBlock(buffer, 0, 0);
                 return ToHex(h.Hash);
             }
         }
 
-        static HashAlgorithm SelectAlgo(string algo)
+        /// <summary>统一算法选择（默认 md5）</summary>
+        private static HashAlgorithm SelectAlgo(string algo)
         {
-            switch (algo.ToLower())
+            switch ((algo ?? "md5").ToLowerInvariant())
             {
                 case "sha1": return SHA1.Create();
+                case "sha256": return SHA256.Create();
                 case "md5":
                 default: return MD5.Create();
             }
         }
 
+        /// <summary>字节数组转十六进制（小写）</summary>
         public static string ToHex(byte[] bytes)
         {
-            var sb = new StringBuilder(bytes.Length * 2);
-            for (int i = 0; i < bytes.Length; i++)
-                sb.Append(bytes[i].ToString("x2"));
-            return sb.ToString();
-        }
-
-        public static string ComputeStream(Stream stream, string algo)
-        {
-            if (stream == null) throw new ArgumentNullException(nameof(stream));
-            algo = (algo ?? "md5").ToLowerInvariant();
-            HashAlgorithm h = algo switch
-            {
-                "md5" => MD5.Create(),
-                "sha1" => SHA1.Create(),
-                "sha256" => SHA256.Create(),
-                _ => MD5.Create()
-            };
-            using (h)
-            {
-                var hash = h.ComputeHash(stream);
-                return BytesToHex(hash);
-            }
-        }
-
-        public static string ComputeBytes(byte[] data, string algo)
-        {
-            if (data == null) throw new ArgumentNullException(nameof(data));
-            algo = (algo ?? "md5").ToLowerInvariant();
-            HashAlgorithm h = algo switch
-            {
-                "md5" => MD5.Create(),
-                "sha1" => SHA1.Create(),
-                "sha256" => SHA256.Create(),
-                _ => MD5.Create()
-            };
-            using (h)
-            {
-                return BytesToHex(h.ComputeHash(data));
-            }
-        }
-
-        private static string BytesToHex(byte[] bytes)
-        {
+            if (bytes == null) return string.Empty;
             var sb = new StringBuilder(bytes.Length * 2);
             for (int i = 0; i < bytes.Length; i++)
                 sb.Append(bytes[i].ToString("x2"));

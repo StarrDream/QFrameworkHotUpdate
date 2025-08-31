@@ -4,20 +4,17 @@ using System.Security.Cryptography;
 namespace QHotUpdateSystem.Security
 {
     /// <summary>
-    /// 增量哈希封装 (批次3: 支持 sha256)
-    /// 对未压缩且非断点续传的文件使用，用于减少二次读取。
+    /// 增量哈希封装
+    /// 仅用于：未压缩 + 不需要断点续传（即一次性从 0 开始下载的场景），在下载过程中直接 Append 数据块。
     /// </summary>
     public class IncrementalHashWrapper : IDisposable
     {
         private readonly HashAlgorithm _algo;
         private bool _finalized;
-        private byte[] _buffer;
-        private int _bufLen;
 
         private IncrementalHashWrapper(HashAlgorithm algo)
         {
             _algo = algo;
-            _buffer = new byte[0];
         }
 
         public static IncrementalHashWrapper Create(string algo)
@@ -25,7 +22,6 @@ namespace QHotUpdateSystem.Security
             algo = (algo ?? "md5").ToLowerInvariant();
             HashAlgorithm h = algo switch
             {
-                "md5" => MD5.Create(),
                 "sha1" => SHA1.Create(),
                 "sha256" => SHA256.Create(),
                 _ => MD5.Create()
@@ -33,23 +29,25 @@ namespace QHotUpdateSystem.Security
             return new IncrementalHashWrapper(h);
         }
 
+        /// <summary>
+        /// 追加一段数据（下载流中的一块）
+        /// </summary>
         public void Append(byte[] data, int offset, int count)
         {
-            if (_finalized) throw new InvalidOperationException("Already finalized");
+            if (_finalized) throw new InvalidOperationException("Hash already finalized");
             if (count <= 0) return;
-            // 直接 TransformBlock，不缓存全部数据
             _algo.TransformBlock(data, offset, count, null, 0);
         }
 
+        /// <summary>
+        /// 结束并返回十六进制哈希
+        /// </summary>
         public string FinalHex()
         {
-            if (_finalized) throw new InvalidOperationException("Already finalized");
+            if (_finalized) throw new InvalidOperationException("Hash already finalized");
             _algo.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
             _finalized = true;
-            return HashUtility.ComputeBytes(_algo.Hash, "md5") switch
-            {
-                _ => BytesToHex(_algo.Hash) // 直接用十六进制输出算法真实结果
-            };
+            return BytesToHex(_algo.Hash);
         }
 
         private string BytesToHex(byte[] bytes)
@@ -69,7 +67,6 @@ namespace QHotUpdateSystem.Security
         public void Dispose()
         {
             _algo?.Dispose();
-            _buffer = null;
         }
     }
 }
