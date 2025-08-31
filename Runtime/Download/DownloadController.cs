@@ -17,9 +17,18 @@ namespace QHotUpdateSystem.Download
         private readonly object _lock = new object();
 
         private CancellationTokenSource _globalCts = new CancellationTokenSource();
+        private bool _globalCancelRequested; // 新增：标记一次 CancelAll 发生（避免立即新建 token 造成取消失效）
 
         public DownloadStateMachine StateMachine { get; } = new DownloadStateMachine();
         public CancellationToken GlobalToken => _globalCts.Token;
+
+        public bool GlobalCancelRequested
+        {
+            get
+            {
+                lock (_lock) return _globalCancelRequested;
+            }
+        }
 
         public bool IsModulePaused(string module)
         {
@@ -28,7 +37,7 @@ namespace QHotUpdateSystem.Download
 
         public bool IsModuleCanceled(string module)
         {
-            lock (_lock) return _canceledModules.Contains(module);
+            lock (_lock) return _canceledModules.Contains(module) || _globalCancelRequested;
         }
 
         public void PauseModule(string module)
@@ -74,45 +83,55 @@ namespace QHotUpdateSystem.Download
         }
 
         /// <summary>
-        /// 取消全部任务
-        /// ★ 修复：旧的 CancellationTokenSource 现在会在安全点异步 Dispose，避免长生命周期泄漏。
+        /// 取消全部任务（修复：不立即重建 Token，避免正在运行任务感知不到取消）
         /// </summary>
         public void CancelAll()
         {
             Dictionary<string, TaskCompletionSource<bool>> signals;
-            CancellationTokenSource oldCts;
             lock (_lock)
             {
-                _canceledModules.Clear();
+                _globalCancelRequested = true;
+                _canceledModules.Clear(); // 这里清空单模块集合，后续通过全局标志判定
                 _pausedModules.Clear();
                 signals = new Dictionary<string, TaskCompletionSource<bool>>(_pauseSignals);
                 _pauseSignals.Clear();
 
-                oldCts = _globalCts;
                 try
                 {
-                    oldCts.Cancel();
+                    _globalCts.Cancel();
                 }
                 catch
                 {
                 }
-
-                _globalCts = new CancellationTokenSource(); // 新 token
+                // ★ 不再在这里创建新的 CTS；由 DownloadManager 在安全点调用 RenewGlobalToken()
             }
 
             foreach (var kv in signals)
                 kv.Value.TrySetResult(false);
+        }
 
-            // ★ 异步延迟释放，避免与仍在使用旧 token 的注册产生竞态
-            if (oldCts != null)
+        /// <summary>
+        /// DownloadManager 在之前一轮下载全部结束（或被取消）后调用，重置全局取消状态并生成新 token。
+        /// </summary>
+        internal void RenewGlobalToken()
+        {
+            CancellationTokenSource old = null;
+            lock (_lock)
             {
-                System.Threading.Tasks.Task.Run(() =>
+                if (!_globalCancelRequested) return;
+                old = _globalCts;
+                _globalCts = new CancellationTokenSource();
+                _globalCancelRequested = false;
+            }
+
+            // 延迟释放旧 CTS（避免极短时间内的已注册回调与 Dispose 竞态）
+            if (old != null)
+            {
+                Task.Run(() =>
                 {
                     try
                     {
-                        // 给仍在使用的代码一个极短窗口（这里简单 Sleep 50ms，可选）
-                        System.Threading.Thread.Sleep(50);
-                        oldCts.Dispose();
+                        old.Dispose();
                     }
                     catch
                     {
@@ -128,7 +147,7 @@ namespace QHotUpdateSystem.Download
                 TaskCompletionSource<bool> tcs = null;
                 lock (_lock)
                 {
-                    if (!_pausedModules.Contains(module) || token.IsCancellationRequested) return;
+                    if (!_pausedModules.Contains(module) || token.IsCancellationRequested || _globalCancelRequested) return;
                     if (_pauseSignals.TryGetValue(module, out tcs) == false)
                     {
                         tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -151,7 +170,7 @@ namespace QHotUpdateSystem.Download
         public bool ShouldAbort(string module, CancellationToken token)
         {
             lock (_lock)
-                return token.IsCancellationRequested || _canceledModules.Contains(module);
+                return _globalCancelRequested || token.IsCancellationRequested || _canceledModules.Contains(module);
         }
 
         public void ClearModuleFlags(string module)

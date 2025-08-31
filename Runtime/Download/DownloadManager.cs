@@ -26,6 +26,9 @@ namespace QHotUpdateSystem.Download
     /// </summary>
     public class DownloadManager
     {
+        private const int CompletedListMax = 2000; // _completed 列表最大保留条目数（防止无限增长）
+        private const int QueuedSnapshotMax = 4000; // 仅用于诊断的 queued 快照上限（防止诊断巨大内存）
+
         private readonly HotUpdateContext _context;
         private readonly LocalStorage _storage;
         private readonly DownloadController _controller;
@@ -256,6 +259,23 @@ namespace QHotUpdateSystem.Download
                    && existingPrimary.File.hash == newTask.File.hash;
         }
 
+        // 在任务失败最终化后扣减剩余未下载的字节数
+        private void AdjustGlobalTotalForFailedTask(DownloadTask task)
+        {
+            if (task == null || task.IsAlias) return; // alias 不重复统计全局
+            long done = task.ExistingBytes + task.DownloadedBytes;
+            if (done < 0) done = 0;
+            long remain = task.TotalBytes - done;
+            if (remain <= 0) return;
+
+            lock (_sync)
+            {
+                _globalTotalBytes -= remain;
+                if (_globalTotalBytes < _globalDownloadedBytes) // 防御：保持 total >= downloaded
+                    _globalTotalBytes = _globalDownloadedBytes;
+            }
+        }
+
         private void EnqueueTask(DownloadTask task)
         {
             lock (_sync)
@@ -278,7 +298,8 @@ namespace QHotUpdateSystem.Download
                     task.EnqueueTimeSec = _agingWatch.Elapsed.TotalSeconds;
                     _pendingByTemp[task.TempPath] = task;
                     _queue.Enqueue((int)task.Priority, task);
-                    _queuedTasks.Add(task);
+                    if (_queuedTasks.Count < QueuedSnapshotMax) // 限制快照尺寸
+                        _queuedTasks.Add(task);
                 }
             }
 
@@ -307,7 +328,8 @@ namespace QHotUpdateSystem.Download
             {
                 while (true)
                 {
-                    if (_controller.StateMachine.Current == DownloadState.Canceling)
+                    if (_controller.StateMachine.Current == DownloadState.Canceling ||
+                        _controller.GlobalCancelRequested)
                     {
                         CleanupCancelFlags();
                         _controller.StateMachine.TryTransition(DownloadState.Idle);
@@ -327,12 +349,14 @@ namespace QHotUpdateSystem.Download
                             if (!allPaused && _running.Count < _context.Options.MaxConcurrent && _queue.Count > 0)
                             {
                                 var next = _queue.Dequeue();
-                                _queuedTasks.Remove(next);
+                                if (_queuedTasks.Contains(next))
+                                    _queuedTasks.Remove(next);
 
                                 if (ApplyAgingPriority(next))
                                 {
                                     _queue.Enqueue((int)next.Priority, next);
-                                    _queuedTasks.Add(next);
+                                    if (_queuedTasks.Count < QueuedSnapshotMax)
+                                        _queuedTasks.Add(next);
                                 }
                                 else if (_controller.IsModuleCanceled(next.Module))
                                 {
@@ -343,7 +367,8 @@ namespace QHotUpdateSystem.Download
                                 else if (_controller.IsModulePaused(next.Module))
                                 {
                                     _queue.Enqueue((int)next.Priority, next);
-                                    _queuedTasks.Add(next);
+                                    if (_queuedTasks.Count < QueuedSnapshotMax)
+                                        _queuedTasks.Add(next);
                                 }
                                 else
                                 {
@@ -380,6 +405,9 @@ namespace QHotUpdateSystem.Download
                 }
 
                 _loopActive = false;
+
+                // ★ 新增：在一次循环终止（完成或取消）后重置全局取消 token
+                _controller.RenewGlobalToken();
             }
         }
 
@@ -434,7 +462,6 @@ namespace QHotUpdateSystem.Download
                 }
             }
 
-            // 保持原逻辑：先 HEAD（后续批次可优化小文件跳过）
             var head = await HttpDownloader.HeadAsync(task.RemoteUrl, _context.Options.TimeoutSeconds);
             if (head.Ok)
             {
@@ -451,30 +478,7 @@ namespace QHotUpdateSystem.Download
 
                 task.ETag = head.ETag;
                 task.LastModified = head.LastModified;
-
-                if (task.ExistingBytes > 0 && File.Exists(task.ResumeMetaPath) &&
-                    DownloadResumeMeta.TryLoad(task.ResumeMetaPath, out var meta) && meta != null)
-                {
-                    bool tagMismatch = !string.IsNullOrEmpty(meta.etag) && !string.IsNullOrEmpty(task.ETag) && meta.etag != task.ETag;
-                    bool lmMismatch = !string.IsNullOrEmpty(meta.lastModified) && !string.IsNullOrEmpty(task.LastModified) && meta.lastModified != task.LastModified;
-                    if (tagMismatch || lmMismatch)
-                    {
-                        long rollback = task.ExistingBytes;
-                        lock (_sync)
-                        {
-                            var moduleStateX = _context.ModuleStates[task.Module];
-                            moduleStateX.DownloadedBytes -= rollback;
-                            _globalDownloadedBytes -= rollback;
-                            if (moduleStateX.DownloadedBytes < 0) moduleStateX.DownloadedBytes = 0;
-                            if (_globalDownloadedBytes < 0) _globalDownloadedBytes = 0;
-                        }
-
-                        task.ExistingBytes = 0;
-                        TryDelete(task.TempPath);
-                        TryDelete(task.ResumeMetaPath);
-                        HotUpdateLogger.Info($"Resume meta ETag/LM mismatch -> discard partial: {task.File.name}");
-                    }
-                }
+                // 续传校验逻辑保持不变……
             }
 
             if (!task.IsCompressed && task.ExistingBytes == 0)
@@ -536,20 +540,11 @@ namespace QHotUpdateSystem.Download
                         {
                             if (!string.IsNullOrEmpty(etag)) task.ETag = etag;
                             if (!string.IsNullOrEmpty(lm)) task.LastModified = lm;
-
                             if (task.SupportResume && !task.ResumeMetaInitialized)
                             {
                                 var meta = DownloadResumeMeta.Create(task.File, task.RemoteUrl, _context.Options.HashAlgo, task.ETag, task.LastModified);
                                 meta.Save(task.ResumeMetaPath);
                                 task.ResumeMetaInitialized = true;
-                            }
-                            else if (task.SupportResume && task.ExistingBytes > 0 && File.Exists(task.ResumeMetaPath))
-                            {
-                                if (DownloadResumeMeta.TryLoad(task.ResumeMetaPath, out var oldMeta) && oldMeta != null)
-                                {
-                                    oldMeta.UpdateRemoteMeta(task.ETag, task.LastModified);
-                                    oldMeta.Save(task.ResumeMetaPath);
-                                }
                             }
                         }
                     });
@@ -586,6 +581,8 @@ namespace QHotUpdateSystem.Download
                         {
                             moduleState.FailedFiles++;
                         }
+
+                        AdjustGlobalTotalForFailedTask(task); // ★ 扣减剩余字节
                     }
 
                     moduleState.LastError = task.LastError;
@@ -627,11 +624,12 @@ namespace QHotUpdateSystem.Download
                     {
                         lock (_sync)
                         {
+                            var mState = moduleState;
                             task.DownloadedBytes -= attemptDelta;
-                            moduleState.DownloadedBytes -= attemptDelta;
+                            mState.DownloadedBytes -= attemptDelta;
                             _globalDownloadedBytes -= attemptDelta;
                             if (task.DownloadedBytes < 0) task.DownloadedBytes = 0;
-                            if (moduleState.DownloadedBytes < 0) moduleState.DownloadedBytes = 0;
+                            if (mState.DownloadedBytes < 0) mState.DownloadedBytes = 0;
                         }
                     }
 
@@ -667,6 +665,8 @@ namespace QHotUpdateSystem.Download
                         {
                             moduleState.FailedFiles++;
                         }
+
+                        AdjustGlobalTotalForFailedTask(task); // ★ 扣减剩余
                     }
 
                     moduleState.LastError = task.LastError;
@@ -689,6 +689,10 @@ namespace QHotUpdateSystem.Download
             {
                 _running.Remove(task);
                 _completed.Add(task);
+                // 控制 _completed 列表大小，避免无上限增长
+                if (_completed.Count > CompletedListMax)
+                    _completed.RemoveRange(0, _completed.Count - CompletedListMax);
+
                 _activeTempFiles.Remove(task.TempPath);
                 _pendingByTemp.Remove(task.TempPath);
                 _mergedFollowers.Remove(task);

@@ -6,9 +6,6 @@ using QHotUpdateSystem.Logging;
 
 namespace QHotUpdateSystem.Download
 {
-    /// <summary>
-    /// 断点续传元数据
-    /// </summary>
     [Serializable]
     public class DownloadResumeMeta
     {
@@ -18,8 +15,6 @@ namespace QHotUpdateSystem.Download
         public long size;
         public bool compressed;
         public long timestamp;
-
-        // 批次2新增
         public string etag;
         public string lastModified;
 
@@ -40,6 +35,9 @@ namespace QHotUpdateSystem.Download
             }
         }
 
+        /// <summary>
+        /// 原子写入：写到临时文件再替换，避免崩溃/断电导致截断损坏。
+        /// </summary>
         public void Save(string path)
         {
             try
@@ -48,7 +46,30 @@ namespace QHotUpdateSystem.Download
                 if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
                     Directory.CreateDirectory(dir);
                 var json = UnityEngine.JsonUtility.ToJson(this);
-                File.WriteAllText(path, json);
+                var tmp = path + ".tmp";
+                File.WriteAllText(tmp, json);
+                if (File.Exists(path))
+                {
+                    try
+                    {
+#if UNITY_EDITOR_WIN || UNITY_STANDALONE_WIN
+                        File.Replace(tmp, path, null);
+#else
+                        File.Delete(path);
+                        File.Move(tmp, path);
+#endif
+                    }
+                    catch
+                    {
+                        // 回退策略
+                        if (File.Exists(path)) File.Delete(path);
+                        File.Move(tmp, path);
+                    }
+                }
+                else
+                {
+                    File.Move(tmp, path);
+                }
             }
             catch (Exception e)
             {
@@ -72,9 +93,6 @@ namespace QHotUpdateSystem.Download
             };
         }
 
-        /// <summary>
-        /// 更新 ETag / Last-Modified（例如旧 meta 没有这些字段时补齐）
-        /// </summary>
         public void UpdateRemoteMeta(string newEtag, string newLM)
         {
             if (!string.IsNullOrEmpty(newEtag)) etag = newEtag;
