@@ -5,7 +5,7 @@ using QHotUpdateSystem.Security;
 namespace QHotUpdateSystem.Download
 {
     /// <summary>
-    /// 单文件下载任务（Batch4：新增排队时间戳 & Aging 用原始优先级字段）
+    /// 单文件下载任务
     /// </summary>
     public class DownloadTask
     {
@@ -19,8 +19,8 @@ namespace QHotUpdateSystem.Download
         public long TotalBytes;
         public long ExistingBytes;
         public long DownloadedBytes;
-        public DownloadPriority Priority;          // 当前有效优先级（可能被 aging 调整）
-        public DownloadPriority OriginalPriority;  // 记录初始值，用于诊断
+        public DownloadPriority Priority;
+        public DownloadPriority OriginalPriority;
         public bool SupportResume;
 
         public int RetryCount;
@@ -32,16 +32,23 @@ namespace QHotUpdateSystem.Download
         public int IntegrityRetryCount;
         public System.Action<DownloadTask> OnCompleted;
 
-        // 增量哈希（Batch3）
         internal IncrementalHashWrapper IncrementalHash;
         internal string IncrementalHashHex;
-
-        // 排队时间（秒，基于 DownloadManager 内部 Stopwatch）供老化策略使用
         internal double EnqueueTimeSec;
+
+        // 批次1新增
+        public bool IsAlias;
+
+        // 批次2新增：用于与简化的 HEAD / GET 响应比对
+        public string ETag;
+        public string LastModified;
+
+        // 标记是否已为该任务写入或更新过 meta（避免重复写）
+        internal bool ResumeMetaInitialized;
 
         public override string ToString()
         {
-            return $"{Module}:{File?.name} state={State} retry={RetryCount} integrityRetry={IntegrityRetryCount} priority={Priority} err={LastError}";
+            return $"{Module}:{File?.name} state={State} retry={RetryCount} priority={Priority} alias={IsAlias} etag={ETag}";
         }
     }
 }

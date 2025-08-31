@@ -8,68 +8,132 @@ using QHotUpdateSystem.State;
 namespace QHotUpdateSystem.Download
 {
     /// <summary>
-    /// 下载控制器：统一暂停 / 取消，管理活动 token
+    /// 下载控制器
     /// </summary>
     public class DownloadController
     {
         private readonly HashSet<string> _pausedModules = new HashSet<string>();
         private readonly HashSet<string> _canceledModules = new HashSet<string>();
+        private readonly Dictionary<string, TaskCompletionSource<bool>> _pauseSignals = new Dictionary<string, TaskCompletionSource<bool>>();
+        private readonly object _lock = new object();
+
         private CancellationTokenSource _globalCts = new CancellationTokenSource();
 
         public DownloadStateMachine StateMachine { get; } = new DownloadStateMachine();
-
         public CancellationToken GlobalToken => _globalCts.Token;
 
-        public bool IsModulePaused(string module) => _pausedModules.Contains(module);
-        public bool IsModuleCanceled(string module) => _canceledModules.Contains(module);
+        public bool IsModulePaused(string module)
+        {
+            lock (_lock) return _pausedModules.Contains(module);
+        }
+        public bool IsModuleCanceled(string module)
+        {
+            lock (_lock) return _canceledModules.Contains(module);
+        }
 
         public void PauseModule(string module)
         {
-            if (_pausedModules.Add(module))
+            lock (_lock)
             {
-                // 不需要取消 token，暂停通过任务轮询外部状态处理
+                if (_pausedModules.Add(module))
+                {
+                    if (!_pauseSignals.ContainsKey(module))
+                        _pauseSignals[module] = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                }
             }
         }
 
         public void ResumeModule(string module)
         {
-            _pausedModules.Remove(module);
+            TaskCompletionSource<bool> tcs = null;
+            lock (_lock)
+            {
+                if (_pausedModules.Remove(module))
+                {
+                    if (_pauseSignals.TryGetValue(module, out tcs))
+                        _pauseSignals.Remove(module);
+                }
+            }
+            tcs?.TrySetResult(true); // 唤醒等待
         }
 
         public void CancelModule(string module)
         {
-            if (_canceledModules.Add(module))
+            TaskCompletionSource<bool> tcs = null;
+            lock (_lock)
             {
-                // 取消策略：标记后由下载循环检测 -> Abort
+                if (_canceledModules.Add(module))
+                {
+                    if (_pauseSignals.TryGetValue(module, out tcs))
+                        _pauseSignals.Remove(module);
+                }
             }
+            tcs?.TrySetResult(false); // 取消也唤醒等待
         }
 
         public void CancelAll()
         {
-            _canceledModules.Clear();
-            _pausedModules.Clear();
-            _globalCts.Cancel();
-            _globalCts.Dispose();
-            _globalCts = new CancellationTokenSource();
+            Dictionary<string, TaskCompletionSource<bool>> signals;
+            lock (_lock)
+            {
+                _canceledModules.Clear();
+                _pausedModules.Clear();
+                signals = new Dictionary<string, TaskCompletionSource<bool>>(_pauseSignals);
+                _pauseSignals.Clear();
+                _globalCts.Cancel();
+                _globalCts.Dispose();
+                _globalCts = new CancellationTokenSource();
+            }
+            foreach (var kv in signals)
+                kv.Value.TrySetResult(false);
         }
 
+        /// <summary>
+        /// 暂停等待：若模块被暂停，则阻塞直到恢复或取消。
+        /// </summary>
         public async Task WaitIfPaused(string module, CancellationToken token)
         {
-            while (_pausedModules.Contains(module) && !token.IsCancellationRequested)
+            while (true)
             {
-                await Task.Delay(150, token);
+                TaskCompletionSource<bool> tcs = null;
+                lock (_lock)
+                {
+                    if (!_pausedModules.Contains(module) || token.IsCancellationRequested) return;
+                    if (_pauseSignals.TryGetValue(module, out tcs) == false)
+                    {
+                        tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                        _pauseSignals[module] = tcs;
+                    }
+                }
+                try
+                {
+                    await Task.WhenAny(tcs.Task, Task.Delay(-1, token));
+                    return;
+                }
+                catch (TaskCanceledException)
+                {
+                    return;
+                }
             }
         }
 
         public bool ShouldAbort(string module, CancellationToken token)
         {
-            return token.IsCancellationRequested || _canceledModules.Contains(module);
+            lock (_lock)
+                return token.IsCancellationRequested || _canceledModules.Contains(module);
         }
 
         public void ClearModuleFlags(string module)
         {
-            _pausedModules.Remove(module);
-            _canceledModules.Remove(module);
+            TaskCompletionSource<bool> tcs = null;
+            lock (_lock)
+            {
+                _pausedModules.Remove(module);
+                _canceledModules.Remove(module);
+                if (_pauseSignals.TryGetValue(module, out tcs))
+                    _pauseSignals.Remove(module);
+            }
+            tcs?.TrySetResult(true);
         }
     }
 }

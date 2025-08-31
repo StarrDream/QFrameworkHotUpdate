@@ -9,9 +9,6 @@ namespace QHotUpdateSystem.Editor.Builders
 {
     /// <summary>
     /// 压缩处理：按算法生成单文件压缩包
-    /// zip: 生成临时 zip，内含单一条目（原文件名）
-    /// gzip: 直接 GZipStream
-    /// lz4: 使用 K4os.Compression.LZ4
     /// </summary>
     public static class CompressionProcessor
     {

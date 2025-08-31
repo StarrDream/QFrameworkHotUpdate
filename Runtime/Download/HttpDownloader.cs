@@ -7,21 +7,26 @@ using QHotUpdateSystem.Logging;
 namespace QHotUpdateSystem.Download
 {
     /// <summary>
-    /// HTTP 下载器（Batch3：新增 OnChunk 钩子，保持 OnDelta 兼容）
+    /// HTTP 下载器
     /// </summary>
     public static class HttpDownloader
     {
         public class DownloadOptions
         {
             public int TimeoutSec = 30;
-            public Func<long, bool> OnDelta;                 // 仍保留：统计字节数
-            public Action<byte[], int, int> OnChunk;         // 新增：访问数据块内容（增量哈希）
+            public Func<long, bool> OnDelta;
+            public Action<byte[], int, int> OnChunk;
             public Func<bool> ShouldAbort;
             public Func<Task> OnPauseWait;
             public bool SupportResume = true;
             public long ExistingBytes = 0;
             public long ExpectedTotal = -1;
             public string RemoteUrl;
+
+            /// <summary>
+            /// 新增：获取响应头中的 ETag / Last-Modified（仅在真正发起 GET 时回调一次每次尝试）
+            /// </summary>
+            public Action<string, string> OnResponseMeta;
         }
 
         public class HeadResult
@@ -29,6 +34,8 @@ namespace QHotUpdateSystem.Download
             public bool Ok;
             public long ContentLength;
             public bool AcceptRanges;
+            public string ETag;          // 批次2新增
+            public string LastModified;  // 批次2新增
         }
 
         public struct HttpDownloadResult
@@ -55,7 +62,14 @@ namespace QHotUpdateSystem.Download
                 {
                     var len = resp.ContentLength;
                     bool ar = string.Equals(resp.Headers["Accept-Ranges"], "bytes", StringComparison.OrdinalIgnoreCase);
-                    return new HeadResult { Ok = true, ContentLength = len, AcceptRanges = ar };
+                    return new HeadResult
+                    {
+                        Ok = true,
+                        ContentLength = len,
+                        AcceptRanges = ar,
+                        ETag = resp.Headers["ETag"],
+                        LastModified = resp.Headers["Last-Modified"]
+                    };
                 }
             }
             catch
@@ -115,7 +129,10 @@ namespace QHotUpdateSystem.Download
                 if (resp.ContentLength >= 0 && opt.ExpectedTotal <= 0)
                     opt.ExpectedTotal = useRange && isPartial ? opt.ExistingBytes + resp.ContentLength : resp.ContentLength;
 
-                Directory.CreateDirectory(Path.GetDirectoryName(tempPath));
+                // 回调响应头元信息
+                opt.OnResponseMeta?.Invoke(resp.Headers["ETag"], resp.Headers["Last-Modified"]);
+
+                Directory.CreateDirectory(System.IO.Path.GetDirectoryName(tempPath));
                 using (var fs = new FileStream(tempPath, FileMode.OpenOrCreate, FileAccess.Write, FileShare.Read))
                 {
                     if (useRange)

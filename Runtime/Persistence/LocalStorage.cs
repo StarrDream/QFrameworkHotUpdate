@@ -20,14 +20,10 @@ namespace QHotUpdateSystem.Persistence
 
         public string VersionFile => adapter.GetLocalVersionFilePath();
         public string AssetDir => adapter.GetLocalAssetDir();
-
-        /// <summary> 绝对根目录（GetFullPath）用于安全边界校验 </summary>
         public string AssetDirFullPath => Path.GetFullPath(AssetDir);
-
         public string TempDir => adapter.GetTempDir();
 
         public string GetAssetPath(string fileName) => Path.Combine(AssetDir, fileName);
-
         public string GetTempFile(string fileName) => Path.Combine(TempDir, fileName + ".part");
 
         public string GetTempFile(string moduleName, string fileName, string hash)
@@ -70,10 +66,8 @@ namespace QHotUpdateSystem.Persistence
                         break;
                     }
                 }
-
                 sb.Append(bad ? '_' : c);
             }
-
             return sb.ToString();
         }
 
@@ -88,15 +82,61 @@ namespace QHotUpdateSystem.Persistence
         {
             if (string.IsNullOrEmpty(dir)) return;
             if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
-        } // 续传 meta: 与 temp 文件同目录，以 "<temp>.meta" 或独立策略
+        }
 
         public string GetResumeMetaPathByTemp(string tempFilePath) => tempFilePath + ".meta";
-
-        // 如需要按模块+文件生成 meta 可额外封装
         public string GetResumeMetaPath(string module, string fileName, string hash)
         {
             var temp = GetTempFile(module, fileName, hash);
             return GetResumeMetaPathByTemp(temp);
+        }
+
+        /// <summary>
+        /// 清理过期临时文件（.part 及其 .meta）。基于 meta 中 timestamp；若无 meta 则按文件最后写入时间。
+        /// maxAgeHours: 过期小时数，例如 24
+        /// </summary>
+        public int CleanExpiredTemps(double maxAgeHours)
+        {
+            if (maxAgeHours <= 0) return 0;
+            if (!Directory.Exists(TempDir)) return 0;
+            int removed = 0;
+            var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            foreach (var part in Directory.GetFiles(TempDir, "*.part", SearchOption.TopDirectoryOnly))
+            {
+                try
+                {
+                    var metaPath = part + ".meta";
+                    long ts = 0;
+                    if (File.Exists(metaPath))
+                    {
+                        if (Download.DownloadResumeMeta.TryLoad(metaPath, out var meta) && meta != null)
+                            ts = meta.timestamp;
+                    }
+                    if (ts == 0)
+                    {
+                        ts = (long)(DateTime.UtcNow - File.GetLastWriteTimeUtc(part)).TotalSeconds;
+                        // 若没有 meta，用“文件距现在的秒差”粗略估计，再与阈值比较
+                        if (ts < 0) ts = 0;
+                        // 转换方式不同：这里让 ts 表示文件过去时间秒；统一下面比较逻辑
+                        if (ts > maxAgeHours * 3600)
+                        {
+                            File.Delete(part);
+                            if (File.Exists(metaPath)) File.Delete(metaPath);
+                            removed++;
+                        }
+                        continue;
+                    }
+                    // ts 为写入时刻的 unix 秒
+                    if (now - ts > maxAgeHours * 3600)
+                    {
+                        File.Delete(part);
+                        if (File.Exists(metaPath)) File.Delete(metaPath);
+                        removed++;
+                    }
+                }
+                catch { /* 忽略单个删除失败 */ }
+            }
+            return removed;
         }
     }
 }

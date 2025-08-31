@@ -13,7 +13,7 @@ using QHotUpdateSystem.State;
 namespace QHotUpdateSystem
 {
     /// <summary>
-    /// 热更新管理器：初始化、核心模块更新、普通模块更新调度
+    /// 热更新管理器
     /// </summary>
     public class HotUpdateManager
     {
@@ -28,6 +28,9 @@ namespace QHotUpdateSystem
 
         private IVersionSignatureVerifier _signatureVerifier;
         private bool _enableSignatureVerify;
+
+        // 批次2: 可调的过期清理策略（简单常量，后续可放到配置中）
+        private const double TempPartMaxAgeHours = 24; // 超过 24 小时未完成的临时文件清理
 
         private HotUpdateManager() { }
 
@@ -51,6 +54,11 @@ namespace QHotUpdateSystem
             HotUpdateLogger.EnableDebug = opt.EnableDebugLog;
             _context = new Core.HotUpdateContext(opt);
             _storage = new LocalStorage(_context.PlatformAdapter);
+
+            // 批次2: 先清理过期临时文件，避免旧数据影响续传判定
+            int cleaned = _storage.CleanExpiredTemps(TempPartMaxAgeHours);
+            if (cleaned > 0)
+                HotUpdateLogger.Info($"Clean expired temp parts: {cleaned}");
 
             _context.LocalVersion = VersionLoader.LoadLocal(_context.PlatformAdapter.GetLocalVersionFilePath(), _context.JsonSerializer)
                 ?? new VersionInfo

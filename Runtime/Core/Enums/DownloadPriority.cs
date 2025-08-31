@@ -1,7 +1,7 @@
 ﻿namespace QHotUpdateSystem.Core
 {
     /// <summary>
-    /// 下载优先级（数值越大优先级越高）
+    /// 下载优先级
     /// </summary>
     public enum DownloadPriority
     {

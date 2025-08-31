@@ -1,56 +1,75 @@
-﻿using System.Security.Cryptography;
-using System.Text;
+﻿using System;
+using System.Security.Cryptography;
 
 namespace QHotUpdateSystem.Security
 {
     /// <summary>
-    /// 简易增量哈希封装（批次 3 新增）
-    /// 用途：
-    /// - 边下载写入临时文件，边累积哈希；
-    /// - 完成后直接获得十六进制串，避免再次整文件读取。
-    /// 说明：
-    /// - 仅用于非压缩 & 非断点续传任务；
-    /// - 采用 HashAlgorithm.Create(algo)；若失败则不使用增量模式。
+    /// 增量哈希封装 (批次3: 支持 sha256)
+    /// 对未压缩且非断点续传的文件使用，用于减少二次读取。
     /// </summary>
-    internal sealed class IncrementalHashWrapper
+    public class IncrementalHashWrapper : IDisposable
     {
         private readonly HashAlgorithm _algo;
         private bool _finalized;
+        private byte[] _buffer;
+        private int _bufLen;
 
         private IncrementalHashWrapper(HashAlgorithm algo)
         {
             _algo = algo;
+            _buffer = new byte[0];
         }
 
-        public static IncrementalHashWrapper Create(string algoName)
+        public static IncrementalHashWrapper Create(string algo)
         {
-            try
+            algo = (algo ?? "md5").ToLowerInvariant();
+            HashAlgorithm h = algo switch
             {
-                var a = HashAlgorithm.Create(algoName);
-                if (a == null) return null;
-                return new IncrementalHashWrapper(a);
-            }
-            catch
-            {
-                return null;
-            }
+                "md5" => MD5.Create(),
+                "sha1" => SHA1.Create(),
+                "sha256" => SHA256.Create(),
+                _ => MD5.Create()
+            };
+            return new IncrementalHashWrapper(h);
         }
 
-        public void Append(byte[] buffer, int offset, int count)
+        public void Append(byte[] data, int offset, int count)
         {
-            if (_finalized || _algo == null || buffer == null || count <= 0) return;
-            _algo.TransformBlock(buffer, offset, count, null, 0);
+            if (_finalized) throw new InvalidOperationException("Already finalized");
+            if (count <= 0) return;
+            // 直接 TransformBlock，不缓存全部数据
+            _algo.TransformBlock(data, offset, count, null, 0);
         }
 
         public string FinalHex()
         {
-            if (_finalized) return null;
-            _algo.TransformFinalBlock(System.Array.Empty<byte>(), 0, 0);
+            if (_finalized) throw new InvalidOperationException("Already finalized");
+            _algo.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
             _finalized = true;
-            var bytes = _algo.Hash;
-            var sb = new StringBuilder(bytes.Length * 2);
-            foreach (var b in bytes) sb.Append(b.ToString("x2"));
-            return sb.ToString();
+            return HashUtility.ComputeBytes(_algo.Hash, "md5") switch
+            {
+                _ => BytesToHex(_algo.Hash) // 直接用十六进制输出算法真实结果
+            };
+        }
+
+        private string BytesToHex(byte[] bytes)
+        {
+            char[] c = new char[bytes.Length * 2];
+            int p = 0;
+            for (int i = 0; i < bytes.Length; i++)
+            {
+                byte b = bytes[i];
+                c[p++] = GetHex((b >> 4) & 0xF);
+                c[p++] = GetHex(b & 0xF);
+            }
+            return new string(c);
+        }
+        private char GetHex(int v) => (char)(v < 10 ? ('0' + v) : ('a' + (v - 10)));
+
+        public void Dispose()
+        {
+            _algo?.Dispose();
+            _buffer = null;
         }
     }
 }

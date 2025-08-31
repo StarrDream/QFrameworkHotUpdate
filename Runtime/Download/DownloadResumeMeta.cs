@@ -7,12 +7,7 @@ using QHotUpdateSystem.Logging;
 namespace QHotUpdateSystem.Download
 {
     /// <summary>
-    /// 断点续传元数据：
-    /// - remoteUrl: 下载来源（简单校验避免来源变化继续使用旧 temp）
-    /// - hash / algo: 目标文件最终校验信息
-    /// - size: 目标压缩或原文件实际总大小（根据 FileEntry.compressed 决定用 cSize 或 size）
-    /// - compressed: 是否压缩
-    /// - timestamp: 记录时间（可用于过期策略）
+    /// 断点续传元数据
     /// </summary>
     [Serializable]
     public class DownloadResumeMeta
@@ -23,6 +18,10 @@ namespace QHotUpdateSystem.Download
         public long size;
         public bool compressed;
         public long timestamp;
+
+        // 批次2新增
+        public string etag;
+        public string lastModified;
 
         public static bool TryLoad(string path, out DownloadResumeMeta meta)
         {
@@ -57,7 +56,8 @@ namespace QHotUpdateSystem.Download
             }
         }
 
-        public static DownloadResumeMeta Create(FileEntry file, string remoteUrl, string hashAlgo)
+        public static DownloadResumeMeta Create(FileEntry file, string remoteUrl, string hashAlgo,
+            string etag = null, string lastModified = null)
         {
             return new DownloadResumeMeta
             {
@@ -66,8 +66,20 @@ namespace QHotUpdateSystem.Download
                 algo = hashAlgo,
                 size = file.compressed ? file.cSize : file.size,
                 compressed = file.compressed,
-                timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+                timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                etag = etag,
+                lastModified = lastModified
             };
+        }
+
+        /// <summary>
+        /// 更新 ETag / Last-Modified（例如旧 meta 没有这些字段时补齐）
+        /// </summary>
+        public void UpdateRemoteMeta(string newEtag, string newLM)
+        {
+            if (!string.IsNullOrEmpty(newEtag)) etag = newEtag;
+            if (!string.IsNullOrEmpty(newLM)) lastModified = newLM;
+            timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         }
     }
 }

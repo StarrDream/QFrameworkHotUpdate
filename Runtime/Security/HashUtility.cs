@@ -1,4 +1,5 @@
-﻿using System.Security.Cryptography;
+﻿using System;
+using System.Security.Cryptography;
 using System.Text;
 using System.IO;
 
@@ -42,6 +43,7 @@ namespace QHotUpdateSystem.Security
                 {
                     h.TransformBlock(buffer, 0, read, null, 0);
                 }
+
                 h.TransformFinalBlock(buffer, 0, 0);
                 return ToHex(h.Hash);
             }
@@ -58,6 +60,49 @@ namespace QHotUpdateSystem.Security
         }
 
         public static string ToHex(byte[] bytes)
+        {
+            var sb = new StringBuilder(bytes.Length * 2);
+            for (int i = 0; i < bytes.Length; i++)
+                sb.Append(bytes[i].ToString("x2"));
+            return sb.ToString();
+        }
+
+        public static string ComputeStream(Stream stream, string algo)
+        {
+            if (stream == null) throw new ArgumentNullException(nameof(stream));
+            algo = (algo ?? "md5").ToLowerInvariant();
+            HashAlgorithm h = algo switch
+            {
+                "md5" => MD5.Create(),
+                "sha1" => SHA1.Create(),
+                "sha256" => SHA256.Create(),
+                _ => MD5.Create()
+            };
+            using (h)
+            {
+                var hash = h.ComputeHash(stream);
+                return BytesToHex(hash);
+            }
+        }
+
+        public static string ComputeBytes(byte[] data, string algo)
+        {
+            if (data == null) throw new ArgumentNullException(nameof(data));
+            algo = (algo ?? "md5").ToLowerInvariant();
+            HashAlgorithm h = algo switch
+            {
+                "md5" => MD5.Create(),
+                "sha1" => SHA1.Create(),
+                "sha256" => SHA256.Create(),
+                _ => MD5.Create()
+            };
+            using (h)
+            {
+                return BytesToHex(h.ComputeHash(data));
+            }
+        }
+
+        private static string BytesToHex(byte[] bytes)
         {
             var sb = new StringBuilder(bytes.Length * 2);
             for (int i = 0; i < bytes.Length; i++)
