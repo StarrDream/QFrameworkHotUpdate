@@ -200,6 +200,108 @@ namespace QHotUpdateSystem
         }
 
         /// <summary>
+        /// 获取更新信息（包含大小统计）
+        /// </summary>
+        public UpdateInfo GetUpdateInfo()
+        {
+            if (!_initialized || _context.RemoteVersion == null)
+                return new UpdateInfo { IsUpdateAvailable = false };
+
+            var updateInfo = new UpdateInfo();
+            var modulesToUpdate = new List<ModuleUpdateInfo>();
+            long totalSize = 0;
+
+            foreach (var remoteModule in _context.RemoteVersion.modules)
+            {
+                var localModule = FindModule(_context.LocalVersion, remoteModule.name);
+
+                if (localModule == null || localModule.aggregateHash != remoteModule.aggregateHash)
+                {
+                    var changedFiles = VersionComparer.GetChangedFiles(remoteModule, localModule);
+                    long moduleSize = 0;
+
+                    foreach (var file in changedFiles)
+                    {
+                        long fileSize = file.compressed && file.cSize > 0 ? file.cSize : file.size;
+                        moduleSize += fileSize;
+                    }
+
+                    modulesToUpdate.Add(new ModuleUpdateInfo
+                    {
+                        ModuleName = remoteModule.name,
+                        IsMandatory = remoteModule.mandatory,
+                        UpdateSize = moduleSize,
+                        FileCount = changedFiles.Count,
+                        TotalFileCount = remoteModule.fileCount
+                    });
+
+                    totalSize += moduleSize;
+                }
+            }
+
+            updateInfo.IsUpdateAvailable = modulesToUpdate.Count > 0;
+            updateInfo.TotalUpdateSize = totalSize;
+            updateInfo.ModulesToUpdate = modulesToUpdate.ToArray();
+            updateInfo.RemoteVersion = _context.RemoteVersion.version;
+            updateInfo.LocalVersion = _context.LocalVersion?.version ?? "0";
+
+            return updateInfo;
+        }
+
+        /// <summary>
+        /// 获取指定模块的更新大小
+        /// </summary>
+        public long GetModuleUpdateSize(string moduleName)
+        {
+            if (!_initialized || _context.RemoteVersion == null)
+                return 0;
+
+            var remoteModule = FindModule(_context.RemoteVersion, moduleName);
+            var localModule = FindModule(_context.LocalVersion, moduleName);
+
+            if (remoteModule == null || (localModule != null && localModule.aggregateHash == remoteModule.aggregateHash))
+                return 0;
+
+            var changedFiles = VersionComparer.GetChangedFiles(remoteModule, localModule);
+            long totalSize = 0;
+
+            foreach (var file in changedFiles)
+            {
+                long fileSize = file.compressed && file.cSize > 0 ? file.cSize : file.size;
+                totalSize += fileSize;
+            }
+
+            return totalSize;
+        }
+
+        public async Task<long> GetBundleUpdateSize(string[] bundleNames)
+        {
+            var manager = HotUpdateManager.Instance;
+            if (!manager.IsInitialized) return 0;
+
+            // 解析Bundle依赖
+            HashSet<string> closure = manager._context.BundleResolver?.GetClosure(bundleNames)
+                                      ?? new HashSet<string>(bundleNames, StringComparer.OrdinalIgnoreCase);
+
+            // 获取相关模块
+            var modules = new HashSet<string>();
+            foreach (var bundle in closure)
+            {
+                if (manager._context.BundleToModule.TryGetValue(bundle, out var module))
+                    modules.Add(module);
+            }
+
+            // 计算模块更新大小
+            long totalSize = 0;
+            foreach (var module in modules)
+            {
+                totalSize += manager.GetModuleUpdateSize(module);
+            }
+
+            return totalSize;
+        }
+
+        /// <summary>
         /// 旧接口：无会话事件
         /// </summary>
         public async Task EnsureBundlesDownloaded(IEnumerable<string> bundleNames, Core.DownloadPriority priority = Core.DownloadPriority.Normal)
@@ -668,4 +770,22 @@ namespace QHotUpdateSystem
             return null;
         }
     }
+} // 更新信息数据结构
+
+public class UpdateInfo
+{
+    public bool IsUpdateAvailable;
+    public long TotalUpdateSize;
+    public string RemoteVersion;
+    public string LocalVersion;
+    public ModuleUpdateInfo[] ModulesToUpdate;
+}
+
+public class ModuleUpdateInfo
+{
+    public string ModuleName;
+    public bool IsMandatory;
+    public long UpdateSize;
+    public int FileCount;
+    public int TotalFileCount;
 }
