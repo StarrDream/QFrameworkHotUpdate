@@ -21,7 +21,7 @@ namespace QHotUpdateSystem.Platform
 
         public string GetPersistentRoot()
         {
-            return Path.Combine(Application.persistentDataPath, "HotUpdate");
+            return Path.Combine(Application.persistentDataPath);
         }
 
         public string GetLocalVersionFilePath()
