@@ -683,6 +683,63 @@ HotUpdateEvents.OnFileError += (module, file, errorCode, message) => {
 
 ## ❓ 常见问题
 
+### Q: ab资源路径异常怎么处理？
+**A**: 初始化ResKit之前调用
+```csharp
+AssetBundleSettings.LoadAssetResFromStreamingAssetsPath = false;
+```
+
+### Q: asset_bundle_config.bin路径异常怎么处理？
+**A**: 更改QFramework的ResMgr.cs中  public IEnumerator InitResMgrAsync() 函数下的 这段语句:
+```csharp
+ public IEnumerator InitResMgrAsync()
+        {
+            if (AssetBundlePathHelper.SimulationMode)
+            {
+                AssetBundleSettings.AssetBundleConfigFile = ConfigFileUtility.BuildEditorDataTable();
+                yield return null;
+            }
+            else
+            {
+                AssetBundleSettings.AssetBundleConfigFile.Reset();
+
+                var outResult = new List<string>();
+
+                var pathPrefix = AssetBundlePathHelper.PathPrefix;
+
+                // 未进行过热更
+                if (AssetBundleSettings.LoadAssetResFromStreamingAssetsPath)
+                {
+                    var streamingPath = Application.streamingAssetsPath + "/AssetBundles/" +
+                                        AssetBundlePathHelper.GetPlatformName() + "/" + ResDatas.FileName;
+                    outResult.Add(pathPrefix + streamingPath);
+                }
+                // 进行过热更
+                else
+                {
+                    var persistentPath = Application.persistentDataPath + "/HotUpdate/AssetBundles/" +
+                                         AssetBundlePathHelper.GetPlatformName() + "/" + ResDatas.FileName;
+                    outResult.Add(pathPrefix + persistentPath);
+                }
+
+                foreach (var outRes in outResult)
+                {
+                    Debug.Log(outRes);
+                    yield return AssetBundleSettings.AssetBundleConfigFile.LoadFromFileAsync(outRes);
+                }
+
+                yield return null;
+            }
+        }
+
+116行-  var persistentPath = Application.persistentDataPath + "/HotUpdate/AssetBundles/" +
+                                         AssetBundlePathHelper.GetPlatformName() + "/" + ResDatas.FileName;
+
+修改为- var persistentPath = Application.persistentDataPath + "/AssetBundles/" +
+                                         AssetBundlePathHelper.GetPlatformName() + "/" + ResDatas.FileName;
+```
+
+
 ### Q: 如何处理网络异常？
 **A**: 系统内置重试机制，支持断点续传，网络恢复后自动继续下载。新版本支持更精确的错误分类和诊断。
 
