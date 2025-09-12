@@ -34,7 +34,7 @@
 ## 🚀 快速开始
 
 ### 1. 导入系统
-将QHotUpdateSystem文件夹复制到Unity项目的`Assets/Plugins/`目录下。
+将QHotUpdateSystem文件夹复制到Unity项目的`Assets/`目录下(与QFramework保持同级)。
 
 ### 2. 创建配置文件
 在Project窗口右键：`Create → QHotUpdate → Config Asset`  
